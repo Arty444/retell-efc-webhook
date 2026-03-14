@@ -35,6 +35,7 @@ async def retell_webhook(request: Request):
         "trial_time": custom.get("trial_time", ""),
         "program": custom.get("program", ""),
         "call_date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "call_summary": analysis.get("call_summary", ""),
     }
     
     log.info("Sending to Zapier: %s", payload)
