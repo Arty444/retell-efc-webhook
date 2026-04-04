@@ -147,35 +147,45 @@
 
         try {
             permissionStatus.textContent = 'Requesting microphone access...';
-            // Try to get stereo (2-channel) audio to use phone's multiple mics
-            try {
-                state.mediaStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        echoCancellation: false,
-                        noiseSuppression: false,
-                        autoGainControl: false,
-                        sampleRate: 44100,
-                        channelCount: { ideal: 2 },  // Request stereo from phone's multiple mics
-                    },
-                });
-                const audioTrack = state.mediaStream.getAudioTracks()[0];
-                const settings = audioTrack.getSettings();
-                state.hasStereo = (settings.channelCount || 1) >= 2;
-                permissionStatus.textContent = state.hasStereo
-                    ? 'Stereo mics detected! Instant direction available.'
-                    : 'Mono mic detected. Scan mode for direction.';
-            } catch (e) {
-                // Fallback to mono
-                state.mediaStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        echoCancellation: false,
-                        noiseSuppression: false,
-                        autoGainControl: false,
-                        sampleRate: 44100,
-                    },
-                });
-                state.hasStereo = false;
+            // Request maximum mic channels (iPhone 16 PM has 4 mics)
+            // Web Audio API may expose 2+ channels depending on browser/OS
+            var micChannels = 1;
+            for (var tryChannels = 4; tryChannels >= 2; tryChannels--) {
+                try {
+                    state.mediaStream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            autoGainControl: false,
+                            sampleRate: 44100,
+                            channelCount: { ideal: tryChannels, min: 1 },
+                        },
+                    });
+                    var audioTrack = state.mediaStream.getAudioTracks()[0];
+                    var settings = audioTrack.getSettings();
+                    micChannels = settings.channelCount || 1;
+                    break;
+                } catch (e) {
+                    if (tryChannels === 2) {
+                        // Final fallback to mono
+                        state.mediaStream = await navigator.mediaDevices.getUserMedia({
+                            audio: {
+                                echoCancellation: false,
+                                noiseSuppression: false,
+                                autoGainControl: false,
+                                sampleRate: 44100,
+                            },
+                        });
+                        micChannels = 1;
+                    }
+                }
             }
+            state.micCount = micChannels;
+            state.hasStereo = micChannels >= 2;
+            var micMsg = micChannels >= 4 ? '4 mics detected! Full 3D localization.'
+                       : micChannels >= 2 ? micChannels + ' mics detected. Stereo direction.'
+                       : 'Mono mic. Use scan mode for direction.';
+            permissionStatus.textContent = micMsg;
 
             permissionStatus.textContent = 'Requesting camera access...';
             const videoStream = await navigator.mediaDevices.getUserMedia({
@@ -231,22 +241,25 @@
         state.analyser.fftSize = 256;
         source.connect(state.analyser);
 
-        // Use 2 input channels if stereo available, else 1
-        const inputChannels = state.hasStereo ? 2 : 1;
-        const bufferSize = 4096;
-        const processor = state.audioContext.createScriptProcessor(bufferSize, inputChannels, 1);
+        // Request as many input channels as the phone provides
+        var inputChannels = state.micCount || 1;
+        var bufferSize = 4096;
+        var processor = state.audioContext.createScriptProcessor(bufferSize, inputChannels, 1);
 
-        processor.onaudioprocess = (e) => {
+        processor.onaudioprocess = function(e) {
             if (!state.isListening) return;
 
-            const ch1 = new Float32Array(e.inputBuffer.getChannelData(0));
+            var nCh = e.inputBuffer.numberOfChannels;
+            var ch0 = new Float32Array(e.inputBuffer.getChannelData(0));
 
-            if (state.hasStereo && e.inputBuffer.numberOfChannels >= 2) {
-                // Stereo mode: capture both channels for ITD
-                const ch2 = new Float32Array(e.inputBuffer.getChannelData(1));
+            if (nCh >= 2) {
+                // Capture all available channels
+                var allChannels = [];
+                for (var c = 0; c < nCh; c++) {
+                    allChannels.push(new Float32Array(e.inputBuffer.getChannelData(c)));
+                }
                 state.stereoChunkBuffer.push({
-                    ch1: ch1,
-                    ch2: ch2,
+                    channels: allChannels,
                     heading: state.currentHeading,
                     pitch: state.devicePitch,
                     roll: state.deviceRoll,
@@ -254,16 +267,18 @@
                 });
             }
 
-            // Always buffer ch1 for mono fallback/classification
+            // Always buffer ch0 for mono fallback/classification
             state.audioChunkBuffer.push({
-                pcm: ch1,
+                pcm: ch0,
                 heading: state.currentHeading,
                 timestamp: Date.now(),
             });
 
-            const now = Date.now();
+            var now = Date.now();
             if (now - state.lastSendTime >= CHUNK_INTERVAL_MS) {
-                if (state.hasStereo) {
+                if (nCh >= 4) {
+                    send4MicChunk();
+                } else if (nCh >= 2) {
                     sendStereoChunk();
                 } else {
                     sendAudioChunk();
@@ -333,6 +348,46 @@
             heading: Math.round(avgH * 10) / 10,
             pitch: Math.round(lastChunk.pitch * 10) / 10,
             roll: Math.round(lastChunk.roll * 10) / 10,
+        }));
+
+        var cutoff = Date.now() - SEND_BUFFER_SECONDS * 1000;
+        state.stereoChunkBuffer = state.stereoChunkBuffer.filter(function(c) { return c.timestamp > cutoff; });
+        state.audioChunkBuffer = state.audioChunkBuffer.filter(function(c) { return c.timestamp > cutoff; });
+    }
+
+    function send4MicChunk() {
+        if (!state.wsConnection || state.wsConnection.readyState !== WebSocket.OPEN) return;
+        if (state.stereoChunkBuffer.length === 0) return;
+
+        // Merge all 4 channels across buffered chunks
+        var nCh = state.stereoChunkBuffer[0].channels.length;
+        var totalSamples = state.stereoChunkBuffer.reduce(function(s, c) { return s + c.channels[0].length; }, 0);
+        var merged = [];
+        for (var c = 0; c < nCh; c++) { merged.push(new Float32Array(totalSamples)); }
+        var off = 0;
+        for (var i = 0; i < state.stereoChunkBuffer.length; i++) {
+            var chunk = state.stereoChunkBuffer[i];
+            for (var c = 0; c < nCh; c++) {
+                merged[c].set(chunk.channels[c], off);
+            }
+            off += chunk.channels[0].length;
+        }
+
+        var avgH = averageHeading(state.stereoChunkBuffer.map(function(c) { return c.heading; }));
+        var last = state.stereoChunkBuffer[state.stereoChunkBuffer.length - 1];
+
+        // Encode each channel as base64 Int16
+        var encodedChannels = merged.map(function(ch) {
+            return arrayBufferToBase64(float32ToInt16(ch).buffer);
+        });
+
+        state.wsConnection.send(JSON.stringify({
+            type: 'audio_4mic',
+            channels: encodedChannels,
+            sample_rate: state.audioContext.sampleRate,
+            heading: Math.round(avgH * 10) / 10,
+            pitch: Math.round(last.pitch * 10) / 10,
+            roll: Math.round(last.roll * 10) / 10,
         }));
 
         var cutoff = Date.now() - SEND_BUFFER_SECONDS * 1000;
@@ -413,8 +468,11 @@
 
             // Update mic mode indicator
             var micMode = document.getElementById('mic-mode');
-            if (state.hasStereo) {
-                micMode.textContent = 'STEREO';
+            if (state.micCount >= 4) {
+                micMode.textContent = '4-MIC 3D';
+                micMode.className = 'mic-badge';
+            } else if (state.micCount >= 2) {
+                micMode.textContent = state.micCount + '-MIC';
                 micMode.className = 'mic-badge';
             } else {
                 micMode.textContent = 'MONO';
@@ -473,6 +531,25 @@
         // Multi-device triangulation result
         if (msg.type === 'triangulation' && msg.result) {
             handleTriangulation(msg);
+        }
+
+        // 4-mic 3D direction (iPhone 16 Pro Max)
+        if (msg.type === 'direction_4mic' && msg.direction) {
+            state.targetHeading = msg.direction.heading;
+            state.targetConfidence = msg.direction.confidence;
+            state.targetElevation = msg.direction.elevation || 0;
+            state.micChannel = '4mic-3d';
+            state.lastDetectionTime = Date.now();
+
+            if (!detectionPanel.classList.contains('hidden')) {
+                var dir = getCardinalDirection(msg.direction.heading);
+                var elevStr = Math.round(msg.direction.elevation) !== 0
+                    ? ' | Elev: ' + Math.round(msg.direction.elevation) + '\u00B0' : '';
+                directionInfo.textContent = 'Direction: ' + dir +
+                    ' (' + Math.round(msg.direction.heading) + '\u00B0)' + elevStr +
+                    ' [' + (msg.mic_count || '?') + ' mics, ' +
+                    (msg.direction.n_pairs_used || '?') + ' pairs]';
+            }
         }
 
         // Stereo direction (primary ITD-based direction from phone mics)

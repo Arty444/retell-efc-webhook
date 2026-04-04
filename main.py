@@ -17,6 +17,8 @@ from audio_direction import (
     estimate_direction,
     estimate_direction_stereo,
     estimate_direction_stereo_continuous,
+    estimate_direction_4mic,
+    estimate_direction_4mic_continuous,
     estimate_directions_multi_source,
 )
 from sound_separation import separate_sources
@@ -276,6 +278,7 @@ async def audio_websocket(websocket: WebSocket):
       {"type": "config", "latitude": float, "longitude": float, "enable_separation": bool}
       {"type": "audio_chunk", "data": "<base64 Int16 PCM>", "sample_rate": int, "heading": float}
       {"type": "audio_stereo", "ch1": "<base64>", "ch2": "<base64>", "sample_rate": int, "heading": float}
+      {"type": "audio_4mic", "channels": ["<base64>",...], "sample_rate": int, "heading": float, "pitch": float, "roll": float}
       {"type": "join_room", "room_id": str, "device_id": str}
 
     Server sends:
@@ -290,8 +293,9 @@ async def audio_websocket(websocket: WebSocket):
     # Per-connection state
     config = {"latitude": 0.0, "longitude": 0.0, "enable_separation": False}
     audio_buffer = []          # mono chunks for BirdNET classification
-    stereo_buffer = []         # stereo chunks for ITD direction estimation
-    has_stereo = False         # whether client is sending stereo data
+    stereo_buffer = []         # stereo/4-mic chunks for direction estimation
+    has_stereo = False         # whether client is sending multi-channel data
+    mic_count = 1              # number of mic channels available
     ANALYSIS_WINDOW_SECONDS = 3.0
     ANALYSIS_INTERVAL_CHUNKS = 4
     chunk_count = 0
@@ -333,8 +337,91 @@ async def audio_websocket(websocket: WebSocket):
                     })
                 continue
 
+            if msg_type == "audio_4mic":
+                # 4-microphone mode (iPhone 16 Pro Max): full 3D TDOA localization
+                has_stereo = True
+                try:
+                    ch_data = data["channels"]  # list of base64-encoded Int16 channels
+                    channels_np = []
+                    for ch_b64 in ch_data:
+                        ch_bytes = base64.b64decode(ch_b64)
+                        ch_int16 = np.frombuffer(ch_bytes, dtype=np.int16)
+                        channels_np.append(ch_int16.astype(np.float32) / 32768.0)
+                    sr = int(data.get("sample_rate", 44100))
+                    heading = float(data.get("heading", 0))
+                    pitch = float(data.get("pitch", 90))
+                    roll = float(data.get("roll", 0))
+                    mic_count = len(channels_np)
+                except Exception as e:
+                    logger.warning("Failed to decode 4-mic audio: %s", e)
+                    continue
+
+                # Merge ch0 into mono buffer for BirdNET classification
+                audio_buffer.append({
+                    "pcm": channels_np[0],
+                    "heading": heading,
+                    "timestamp": datetime.utcnow().timestamp(),
+                })
+
+                # Buffer all channels for 4-mic TDOA
+                stereo_buffer.append({
+                    "channels": channels_np,
+                    "heading": heading, "pitch": pitch, "roll": roll,
+                    "timestamp": datetime.utcnow().timestamp(),
+                })
+
+                now = datetime.utcnow().timestamp()
+                stereo_buffer = [c for c in stereo_buffer if now - c["timestamp"] < ANALYSIS_WINDOW_SECONDS]
+                audio_buffer = [c for c in audio_buffer if now - c["timestamp"] < ANALYSIS_WINDOW_SECONDS * 2]
+
+                chunk_count += 1
+
+                # Run 4-mic 3D direction estimation (every 2 chunks)
+                if chunk_count % 2 == 0 and len(stereo_buffer) >= 2:
+                    dir_4mic = estimate_direction_4mic_continuous(stereo_buffer, sr)
+                    if dir_4mic:
+                        await websocket.send_json({
+                            "type": "direction_4mic",
+                            "direction": dir_4mic,
+                            "mic_count": mic_count,
+                        })
+
+                # Run BirdNET classification periodically
+                if chunk_count % ANALYSIS_INTERVAL_CHUNKS == 0 and len(audio_buffer) >= 2:
+                    recent = [c for c in audio_buffer if now - c["timestamp"] < ANALYSIS_WINDOW_SECONDS]
+                    if recent:
+                        merged_pcm = np.concatenate([c["pcm"] for c in recent])
+                        if config["enable_separation"]:
+                            await _handle_multi_bird(websocket, merged_pcm, recent, sr, config)
+                        else:
+                            try:
+                                detections = analyze_audio(
+                                    pcm_data=merged_pcm, sample_rate=sr,
+                                    latitude=config["latitude"], longitude=config["longitude"],
+                                    min_confidence=0.25,
+                                )
+                            except Exception as e:
+                                logger.error("BirdNET analysis failed: %s", e)
+                                detections = []
+
+                            dir_4mic = estimate_direction_4mic_continuous(stereo_buffer, sr)
+                            if detections:
+                                await websocket.send_json({
+                                    "type": "detection",
+                                    "detections": detections,
+                                    "direction": dir_4mic,
+                                })
+                                logger.info(
+                                    "4-mic detected: %s (%.0f%%) heading=%s elev=%s",
+                                    detections[0]["species"],
+                                    detections[0]["confidence"] * 100,
+                                    dir_4mic.get("heading") if dir_4mic else "?",
+                                    dir_4mic.get("elevation") if dir_4mic else "?",
+                                )
+                continue
+
             if msg_type == "audio_stereo":
-                # Stereo mic mode: two channels for ITD-based direction
+                # Stereo mic mode (2 channels): ITD-based direction
                 has_stereo = True
                 try:
                     ch1_bytes = base64.b64decode(data["ch1"])
