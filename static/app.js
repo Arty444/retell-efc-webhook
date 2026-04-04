@@ -37,6 +37,10 @@
         mediaStream: null,
         wsConnection: null,
         audioChunkBuffer: [],
+        stereoChunkBuffer: [],  // stereo chunks for ITD direction
+        hasStereo: false,       // whether phone supports stereo mic
+        devicePitch: 90,        // device orientation
+        deviceRoll: 0,
         lastSendTime: 0,
     };
 
@@ -143,14 +147,35 @@
 
         try {
             permissionStatus.textContent = 'Requesting microphone access...';
-            state.mediaStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: false,
-                    noiseSuppression: false,
-                    autoGainControl: false,
-                    sampleRate: 44100,
-                },
-            });
+            // Try to get stereo (2-channel) audio to use phone's multiple mics
+            try {
+                state.mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false,
+                        sampleRate: 44100,
+                        channelCount: { ideal: 2 },  // Request stereo from phone's multiple mics
+                    },
+                });
+                const audioTrack = state.mediaStream.getAudioTracks()[0];
+                const settings = audioTrack.getSettings();
+                state.hasStereo = (settings.channelCount || 1) >= 2;
+                permissionStatus.textContent = state.hasStereo
+                    ? 'Stereo mics detected! Instant direction available.'
+                    : 'Mono mic detected. Scan mode for direction.';
+            } catch (e) {
+                // Fallback to mono
+                state.mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false,
+                        sampleRate: 44100,
+                    },
+                });
+                state.hasStereo = false;
+            }
 
             permissionStatus.textContent = 'Requesting camera access...';
             const videoStream = await navigator.mediaDevices.getUserMedia({
@@ -206,24 +231,43 @@
         state.analyser.fftSize = 256;
         source.connect(state.analyser);
 
+        // Use 2 input channels if stereo available, else 1
+        const inputChannels = state.hasStereo ? 2 : 1;
         const bufferSize = 4096;
-        const processor = state.audioContext.createScriptProcessor(bufferSize, 1, 1);
+        const processor = state.audioContext.createScriptProcessor(bufferSize, inputChannels, 1);
 
         processor.onaudioprocess = (e) => {
             if (!state.isListening) return;
 
-            const inputData = e.inputBuffer.getChannelData(0);
-            const pcmCopy = new Float32Array(inputData);
+            const ch1 = new Float32Array(e.inputBuffer.getChannelData(0));
 
+            if (state.hasStereo && e.inputBuffer.numberOfChannels >= 2) {
+                // Stereo mode: capture both channels for ITD
+                const ch2 = new Float32Array(e.inputBuffer.getChannelData(1));
+                state.stereoChunkBuffer.push({
+                    ch1: ch1,
+                    ch2: ch2,
+                    heading: state.currentHeading,
+                    pitch: state.devicePitch,
+                    roll: state.deviceRoll,
+                    timestamp: Date.now(),
+                });
+            }
+
+            // Always buffer ch1 for mono fallback/classification
             state.audioChunkBuffer.push({
-                pcm: pcmCopy,
+                pcm: ch1,
                 heading: state.currentHeading,
                 timestamp: Date.now(),
             });
 
             const now = Date.now();
             if (now - state.lastSendTime >= CHUNK_INTERVAL_MS) {
-                sendAudioChunk();
+                if (state.hasStereo) {
+                    sendStereoChunk();
+                } else {
+                    sendAudioChunk();
+                }
                 state.lastSendTime = now;
             }
         };
@@ -257,6 +301,43 @@
 
         const cutoff = Date.now() - SEND_BUFFER_SECONDS * 1000;
         state.audioChunkBuffer = state.audioChunkBuffer.filter((c) => c.timestamp > cutoff);
+    }
+
+    function sendStereoChunk() {
+        if (!state.wsConnection || state.wsConnection.readyState !== WebSocket.OPEN) return;
+        if (state.stereoChunkBuffer.length === 0) return;
+
+        // Merge stereo chunks
+        var totalSamples = state.stereoChunkBuffer.reduce(function(sum, c) { return sum + c.ch1.length; }, 0);
+        var mergedCh1 = new Float32Array(totalSamples);
+        var mergedCh2 = new Float32Array(totalSamples);
+        var off = 0;
+        for (var i = 0; i < state.stereoChunkBuffer.length; i++) {
+            var chunk = state.stereoChunkBuffer[i];
+            mergedCh1.set(chunk.ch1, off);
+            mergedCh2.set(chunk.ch2, off);
+            off += chunk.ch1.length;
+        }
+
+        var avgH = averageHeading(state.stereoChunkBuffer.map(function(c) { return c.heading; }));
+        var lastChunk = state.stereoChunkBuffer[state.stereoChunkBuffer.length - 1];
+
+        var int16Ch1 = float32ToInt16(mergedCh1);
+        var int16Ch2 = float32ToInt16(mergedCh2);
+
+        state.wsConnection.send(JSON.stringify({
+            type: 'audio_stereo',
+            ch1: arrayBufferToBase64(int16Ch1.buffer),
+            ch2: arrayBufferToBase64(int16Ch2.buffer),
+            sample_rate: state.audioContext.sampleRate,
+            heading: Math.round(avgH * 10) / 10,
+            pitch: Math.round(lastChunk.pitch * 10) / 10,
+            roll: Math.round(lastChunk.roll * 10) / 10,
+        }));
+
+        var cutoff = Date.now() - SEND_BUFFER_SECONDS * 1000;
+        state.stereoChunkBuffer = state.stereoChunkBuffer.filter(function(c) { return c.timestamp > cutoff; });
+        state.audioChunkBuffer = state.audioChunkBuffer.filter(function(c) { return c.timestamp > cutoff; });
     }
 
     function float32ToInt16(float32) {
@@ -301,6 +382,9 @@
                 return;
             }
             state.currentHeading = heading;
+            // Capture pitch and roll for mic axis orientation mapping
+            if (e.beta !== null) state.devicePitch = e.beta;   // -180 to 180 (90 = upright)
+            if (e.gamma !== null) state.deviceRoll = e.gamma;  // -90 to 90 (0 = portrait)
             compassHeading.textContent = Math.round(heading) + '\u00B0';
         });
 
@@ -326,6 +410,16 @@
                 longitude: state.longitude,
                 enable_separation: state.enableSeparation,
             }));
+
+            // Update mic mode indicator
+            var micMode = document.getElementById('mic-mode');
+            if (state.hasStereo) {
+                micMode.textContent = 'STEREO';
+                micMode.className = 'mic-badge';
+            } else {
+                micMode.textContent = 'MONO';
+                micMode.className = 'mic-badge mono';
+            }
 
             // Join room if one was configured
             if (state.roomId) {
@@ -381,11 +475,23 @@
             handleTriangulation(msg);
         }
 
-        // Stereo direction
+        // Stereo direction (primary ITD-based direction from phone mics)
         if (msg.type === 'stereo_direction' && msg.direction) {
             state.targetHeading = msg.direction.heading;
             state.targetConfidence = msg.direction.confidence;
+            state.targetElevation = msg.direction.elevation || 0;
+            state.micChannel = msg.direction.mic_channel || 'unknown';
             state.lastDetectionTime = Date.now();
+
+            // Update direction info if detection panel is showing
+            if (!detectionPanel.classList.contains('hidden')) {
+                var dir = getCardinalDirection(msg.direction.heading);
+                var elevStr = msg.direction.elevation !== 0
+                    ? ' | Elev: ' + Math.round(msg.direction.elevation) + '\u00B0' : '';
+                directionInfo.textContent = 'Direction: ' + dir +
+                    ' (' + Math.round(msg.direction.heading) + '\u00B0)' + elevStr +
+                    ' | ITD: ' + msg.direction.itd_us + '\u00B5s';
+            }
         }
 
         // Room joined
@@ -507,7 +613,9 @@
         listenBtn.classList.toggle('active', state.isListening);
 
         if (state.isListening) {
-            statusText.textContent = state.enableSeparation ? 'Listening (multi-bird)...' : 'Listening...';
+            var micMode = state.hasStereo ? 'stereo ITD' : 'mono';
+            var birdMode = state.enableSeparation ? 'multi-bird' : 'single';
+            statusText.textContent = 'Listening (' + birdMode + ', ' + micMode + ')...';
             if (state.audioContext && state.audioContext.state === 'suspended') {
                 state.audioContext.resume();
             }

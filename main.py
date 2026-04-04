@@ -13,7 +13,12 @@ from fastapi.staticfiles import StaticFiles
 from supabase import create_client, Client
 
 from bird_analyzer import analyze_audio
-from audio_direction import estimate_direction, estimate_direction_stereo, estimate_directions_multi_source
+from audio_direction import (
+    estimate_direction,
+    estimate_direction_stereo,
+    estimate_direction_stereo_continuous,
+    estimate_directions_multi_source,
+)
 from sound_separation import separate_sources
 from multi_device_locator import DeviceRoom
 
@@ -284,7 +289,9 @@ async def audio_websocket(websocket: WebSocket):
 
     # Per-connection state
     config = {"latitude": 0.0, "longitude": 0.0, "enable_separation": False}
-    audio_buffer = []
+    audio_buffer = []          # mono chunks for BirdNET classification
+    stereo_buffer = []         # stereo chunks for ITD direction estimation
+    has_stereo = False         # whether client is sending stereo data
     ANALYSIS_WINDOW_SECONDS = 3.0
     ANALYSIS_INTERVAL_CHUNKS = 4
     chunk_count = 0
@@ -328,6 +335,7 @@ async def audio_websocket(websocket: WebSocket):
 
             if msg_type == "audio_stereo":
                 # Stereo mic mode: two channels for ITD-based direction
+                has_stereo = True
                 try:
                     ch1_bytes = base64.b64decode(data["ch1"])
                     ch2_bytes = base64.b64decode(data["ch2"])
@@ -335,16 +343,68 @@ async def audio_websocket(websocket: WebSocket):
                     ch2 = np.frombuffer(ch2_bytes, dtype=np.int16).astype(np.float32) / 32768.0
                     sr = int(data.get("sample_rate", 44100))
                     heading = float(data.get("heading", 0))
+                    pitch = float(data.get("pitch", 90))
+                    roll = float(data.get("roll", 0))
                 except Exception as e:
                     logger.warning("Failed to decode stereo audio: %s", e)
                     continue
 
-                stereo_dir = estimate_direction_stereo(ch1, ch2, sr, heading)
-                if stereo_dir:
-                    await websocket.send_json({
-                        "type": "stereo_direction",
-                        "direction": stereo_dir,
-                    })
+                # Also merge ch1 into mono buffer for BirdNET classification
+                audio_buffer.append({
+                    "pcm": ch1,
+                    "heading": heading,
+                    "timestamp": datetime.utcnow().timestamp(),
+                })
+
+                # Add to stereo buffer for continuous ITD averaging
+                stereo_buffer.append({
+                    "ch1": ch1, "ch2": ch2,
+                    "heading": heading, "pitch": pitch, "roll": roll,
+                    "timestamp": datetime.utcnow().timestamp(),
+                })
+
+                # Trim stereo buffer
+                now = datetime.utcnow().timestamp()
+                stereo_buffer = [c for c in stereo_buffer if now - c["timestamp"] < ANALYSIS_WINDOW_SECONDS]
+                audio_buffer = [c for c in audio_buffer if now - c["timestamp"] < ANALYSIS_WINDOW_SECONDS * 2]
+
+                chunk_count += 1
+
+                # Run ITD direction estimation continuously (every 2 chunks)
+                if chunk_count % 2 == 0 and len(stereo_buffer) >= 2:
+                    stereo_dir = estimate_direction_stereo_continuous(stereo_buffer, sr)
+                    if stereo_dir:
+                        await websocket.send_json({
+                            "type": "stereo_direction",
+                            "direction": stereo_dir,
+                        })
+
+                # Run BirdNET classification periodically
+                if chunk_count % ANALYSIS_INTERVAL_CHUNKS == 0 and len(audio_buffer) >= 2:
+                    recent = [c for c in audio_buffer if now - c["timestamp"] < ANALYSIS_WINDOW_SECONDS]
+                    if recent:
+                        merged_pcm = np.concatenate([c["pcm"] for c in recent])
+                        if config["enable_separation"]:
+                            await _handle_multi_bird(websocket, merged_pcm, recent, sr, config)
+                        else:
+                            # Use stereo ITD direction instead of amplitude scanning
+                            try:
+                                detections = analyze_audio(
+                                    pcm_data=merged_pcm, sample_rate=sr,
+                                    latitude=config["latitude"], longitude=config["longitude"],
+                                    min_confidence=0.25,
+                                )
+                            except Exception as e:
+                                logger.error("BirdNET analysis failed: %s", e)
+                                detections = []
+
+                            stereo_dir = estimate_direction_stereo_continuous(stereo_buffer, sr)
+                            if detections:
+                                await websocket.send_json({
+                                    "type": "detection",
+                                    "detections": detections,
+                                    "direction": stereo_dir,
+                                })
                 continue
 
             if msg_type == "audio_chunk":

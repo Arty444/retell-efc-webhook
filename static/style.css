@@ -232,6 +232,19 @@ body {
     flex: 1;
 }
 
+.mic-badge {
+    font-size: 0.7rem;
+    padding: 2px 6px;
+    border-radius: 6px;
+    background: rgba(78, 205, 196, 0.2);
+    color: #4ecdc4;
+}
+
+.mic-badge.mono {
+    background: rgba(243, 156, 18, 0.2);
+    color: #f39c12;
+}
+
 #compass-heading {
     font-family: 'SF Mono', 'Fira Code', monospace;
     color: #4ecdc4;

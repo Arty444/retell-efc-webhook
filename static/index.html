@@ -22,7 +22,7 @@
                 </svg>
             </div>
             <h1>Bird Sound Locator</h1>
-            <p>Detect and locate birds by their sounds. Point your phone toward bird calls and let AI identify the species.</p>
+            <p>Detect and locate birds by their sounds using your phone's built-in microphones. No extra hardware needed — your phone's 2-3 mics work like a tiny radar array.</p>
             <div class="mode-selector">
                 <button id="start-btn" class="btn-primary">Single Bird Mode</button>
                 <button id="start-multi-btn" class="btn-secondary">Multi-Bird Mode</button>
@@ -58,6 +58,7 @@
         <div id="status-bar">
             <div id="connection-status" class="status-dot disconnected"></div>
             <span id="status-text">Connecting...</span>
+            <span id="mic-mode" class="mic-badge">--</span>
             <span id="compass-heading">--°</span>
         </div>
 
