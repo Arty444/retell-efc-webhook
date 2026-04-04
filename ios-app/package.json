@@ -1,0 +1,14 @@
+{
+  "name": "bird-sound-locator",
+  "version": "1.0.0",
+  "description": "Bird Sound Locator - iPhone 16 Pro Max 4-mic native capture",
+  "scripts": {
+    "build": "npx cap sync ios",
+    "open": "npx cap open ios"
+  },
+  "dependencies": {
+    "@capacitor/core": "^6.0.0",
+    "@capacitor/cli": "^6.0.0",
+    "@capacitor/ios": "^6.0.0"
+  }
+}

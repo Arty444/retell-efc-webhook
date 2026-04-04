@@ -3,24 +3,23 @@ import type { CapacitorConfig } from '@capacitor/cli';
 const config: CapacitorConfig = {
   appId: 'com.birdlocator.app',
   appName: 'Bird Sound Locator',
-  // The web app is served from the Python backend
-  // In development, point to the local server
+  webDir: '../static',
   server: {
-    // For development: use your local machine's IP
-    // url: 'http://192.168.1.x:8000/app',
-    // For production: bundle the static files
+    // ⚠️  IMPORTANT: Set this to your backend server URL before building!
+    //
+    // Option A — Local development (Mac and iPhone on same WiFi):
+    //   Run `ifconfig | grep "inet "` on your Mac to find your IP, then:
+    //   url: 'http://192.168.1.xxx:8000/app',
+    //
+    // Option B — Deployed backend (Railway, etc.):
+    //   url: 'https://your-app.up.railway.app/app',
+    //
+    // The setup script will prompt you for this.
     androidScheme: 'https',
   },
-  // Copy the static web assets from the main project
-  webDir: '../static',
-  plugins: {
-    // No additional Capacitor plugin config needed;
-    // FourMicCapturePlugin is a local native plugin
-  },
+  plugins: {},
   ios: {
-    // Build settings
     scheme: 'BirdLocator',
-    // Required for background audio capture
     backgroundColor: '#1a1a2e',
   },
 };
