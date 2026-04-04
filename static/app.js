@@ -901,4 +901,8 @@
     }
 
     updateHistoryList();
+
+    // Expose state for native mic bridge (Capacitor iOS)
+    window.__birdLocatorState = state;
+    state._toggleListening = toggleListening;
 })();

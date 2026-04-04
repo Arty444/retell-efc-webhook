@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required permission descriptions for App Store -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Bird Sound Locator needs microphone access to detect and identify bird sounds using all 4 microphones for precise directional localization.</string>
+
+    <key>NSCameraUsageDescription</key>
+    <string>Bird Sound Locator uses the camera to show a live viewfinder with AR directional overlays pointing toward detected birds.</string>
+
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Your location helps identify which bird species are likely in your area based on regional and seasonal data.</string>
+
+    <key>NSMotionUsageDescription</key>
+    <string>Device orientation sensors map microphone measurements to compass directions for accurate bird localization.</string>
+
+    <!-- Audio session configuration -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>audio</string>
+    </array>
+</dict>
+</plist>
