@@ -218,6 +218,7 @@
 
             initAudio();
             initCompass();
+            initCameraCapture();
             connectWebSocket();
             requestAnimationFrame(renderLoop);
             registerServiceWorker();
@@ -423,6 +424,54 @@
         }
         let avg = (Math.atan2(sinSum, cosSum) * 180) / Math.PI;
         return (avg + 360) % 360;
+    }
+
+    // --- Camera Frame Capture (for visual rangefinding) ---
+    function initCameraCapture() {
+        // Capture frames from the camera video feed and send to backend
+        // for bird detection + size-based distance estimation.
+        // Uses an offscreen canvas to grab pixel data.
+        var captureCanvas = document.createElement('canvas');
+        var captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
+        var CAPTURE_INTERVAL_MS = 1000; // 1 frame per second (low bandwidth)
+        var CAPTURE_WIDTH = 320;        // Downscale for network efficiency
+        var CAPTURE_HEIGHT = 240;
+        captureCanvas.width = CAPTURE_WIDTH;
+        captureCanvas.height = CAPTURE_HEIGHT;
+
+        setInterval(function() {
+            if (!state.isListening || !state.wsConnection ||
+                state.wsConnection.readyState !== WebSocket.OPEN) return;
+
+            // Only send frames when we have a detected bird (saves bandwidth)
+            if (!state.detectedSpecies && state.activeBirds.length === 0) return;
+
+            if (!cameraFeed.videoWidth || !cameraFeed.videoHeight) return;
+
+            try {
+                captureCtx.drawImage(cameraFeed, 0, 0, CAPTURE_WIDTH, CAPTURE_HEIGHT);
+                var imageData = captureCtx.getImageData(0, 0, CAPTURE_WIDTH, CAPTURE_HEIGHT);
+
+                // Send raw RGBA pixels as base64
+                var uint8 = new Uint8Array(imageData.data.buffer);
+                var binary = '';
+                for (var i = 0; i < uint8.length; i++) {
+                    binary += String.fromCharCode(uint8[i]);
+                }
+                var b64 = btoa(binary);
+
+                state.wsConnection.send(JSON.stringify({
+                    type: 'camera_frame',
+                    data: b64,
+                    width: CAPTURE_WIDTH,
+                    height: CAPTURE_HEIGHT,
+                    heading: state.currentHeading,
+                    zoom: 1.0,
+                }));
+            } catch (e) {
+                // Camera frame capture can fail due to CORS or security restrictions
+            }
+        }, CAPTURE_INTERVAL_MS);
     }
 
     // --- Compass & IMU ---
