@@ -23,7 +23,25 @@
             </div>
             <h1>Bird Sound Locator</h1>
             <p>Detect and locate birds by their sounds. Point your phone toward bird calls and let AI identify the species.</p>
-            <button id="start-btn" class="btn-primary">Start Birding</button>
+            <div class="mode-selector">
+                <button id="start-btn" class="btn-primary">Single Bird Mode</button>
+                <button id="start-multi-btn" class="btn-secondary">Multi-Bird Mode</button>
+            </div>
+            <div class="mode-description">
+                <small>Multi-Bird uses AI sound separation to track multiple birds simultaneously</small>
+            </div>
+
+            <div id="room-section" class="room-section hidden">
+                <p class="section-label">Multi-Device Triangulation (optional)</p>
+                <div class="room-controls">
+                    <button id="create-room-btn" class="btn-small">Create Room</button>
+                    <span class="or-divider">or</span>
+                    <input id="room-id-input" type="text" placeholder="Room code" maxlength="8">
+                    <button id="join-room-btn" class="btn-small">Join</button>
+                </div>
+                <div id="room-status" class="status-text"></div>
+            </div>
+
             <div id="permission-status" class="status-text"></div>
         </div>
     </div>
@@ -43,11 +61,28 @@
             <span id="compass-heading">--°</span>
         </div>
 
-        <!-- Detection Info Panel -->
+        <!-- Detection Info Panel (single bird) -->
         <div id="detection-panel" class="hidden">
             <div id="species-name">--</div>
             <div id="species-confidence">--</div>
             <div id="direction-info">--</div>
+        </div>
+
+        <!-- Multi-Bird Detection Panel -->
+        <div id="multi-detection-panel" class="hidden">
+            <div class="panel-header-inline">
+                <span class="panel-title">Birds Detected</span>
+                <span id="source-count" class="badge">0</span>
+            </div>
+            <div id="bird-list"></div>
+        </div>
+
+        <!-- Triangulation Result (multi-device) -->
+        <div id="triangulation-panel" class="hidden">
+            <div class="tri-label">TRIANGULATED</div>
+            <div id="tri-bearing">--</div>
+            <div id="tri-distance">--</div>
+            <div id="tri-devices">--</div>
         </div>
 
         <!-- Scan Mode Indicator -->

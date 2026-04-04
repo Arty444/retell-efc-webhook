@@ -1,24 +1,36 @@
 /**
  * Bird Sound Locator - Frontend Application
  *
- * Captures audio from the microphone, streams it to the backend for BirdNET
- * classification, tracks device orientation for directional estimation,
- * and renders an AR-style overlay guiding the user toward detected birds.
+ * Supports:
+ * - Single bird detection with directional arrow
+ * - Multi-bird mode: AI source separation tracking multiple birds simultaneously
+ * - Multi-device triangulation: TDOA-based positioning with 2+ phones
+ * - Stereo mic ITD direction estimation
  */
 
 (function () {
     'use strict';
+
+    // Bird colors for multi-bird tracking (up to 6 birds)
+    const BIRD_COLORS = [
+        '#4ecdc4', '#e74c3c', '#f39c12', '#9b59b6', '#3498db', '#2ecc71',
+    ];
 
     // --- State ---
     const state = {
         isListening: false,
         isScanMode: false,
         isConnected: false,
+        enableSeparation: false,
         currentHeading: 0,
         targetHeading: null,
         targetConfidence: 0,
         detectedSpecies: null,
-        detections: [],  // history
+        detections: [],
+        activeBirds: [],      // Multi-bird: currently tracked birds
+        triangulation: null,  // Multi-device TDOA result
+        roomId: null,
+        deviceId: null,
         latitude: 0,
         longitude: 0,
         audioContext: null,
@@ -39,6 +51,7 @@
     const startScreen = $('#start-screen');
     const appScreen = $('#app-screen');
     const startBtn = $('#start-btn');
+    const startMultiBtn = $('#start-multi-btn');
     const permissionStatus = $('#permission-status');
     const cameraFeed = $('#camera-feed');
     const overlayCanvas = $('#overlay-canvas');
@@ -50,6 +63,13 @@
     const speciesName = $('#species-name');
     const speciesConfidence = $('#species-confidence');
     const directionInfo = $('#direction-info');
+    const multiDetectionPanel = $('#multi-detection-panel');
+    const birdList = $('#bird-list');
+    const sourceCount = $('#source-count');
+    const triangulationPanel = $('#triangulation-panel');
+    const triBearing = $('#tri-bearing');
+    const triDistance = $('#tri-distance');
+    const triDevices = $('#tri-devices');
     const scanIndicator = $('#scan-indicator');
     const scanBtn = $('#scan-btn');
     const listenBtn = $('#listen-btn');
@@ -59,9 +79,26 @@
     const historyList = $('#history-list');
     const freqCanvas = $('#freq-canvas');
     const freqCtx = freqCanvas.getContext('2d');
+    const roomSection = $('#room-section');
+    const createRoomBtn = $('#create-room-btn');
+    const joinRoomBtn = $('#join-room-btn');
+    const roomIdInput = $('#room-id-input');
+    const roomStatus = $('#room-status');
 
     // --- Initialization ---
-    startBtn.addEventListener('click', requestPermissionsAndStart);
+    startBtn.addEventListener('click', () => startApp(false));
+    startMultiBtn.addEventListener('click', () => {
+        state.enableSeparation = true;
+        roomSection.classList.remove('hidden');
+    });
+    createRoomBtn.addEventListener('click', createRoom);
+    joinRoomBtn.addEventListener('click', () => {
+        const code = roomIdInput.value.trim();
+        if (code) {
+            state.roomId = code;
+            roomStatus.textContent = 'Room code: ' + code + ' (will join on start)';
+        }
+    });
     listenBtn.addEventListener('click', toggleListening);
     scanBtn.addEventListener('click', toggleScanMode);
     historyBtn.addEventListener('click', () => historyPanel.classList.toggle('hidden'));
@@ -81,13 +118,30 @@
         freqCanvas.height = freqCanvas.parentElement.offsetHeight * devicePixelRatio;
     }
 
+    async function createRoom() {
+        try {
+            const resp = await fetch('/api/room/create', { method: 'POST' });
+            const data = await resp.json();
+            state.roomId = data.room_id;
+            roomIdInput.value = data.room_id;
+            roomStatus.textContent = 'Room created: ' + data.room_id + ' - Share this code!';
+        } catch (err) {
+            roomStatus.textContent = 'Failed to create room: ' + err.message;
+        }
+    }
+
+    function startApp(skipSeparation) {
+        if (skipSeparation) state.enableSeparation = false;
+        requestPermissionsAndStart();
+    }
+
     // --- Permissions & Startup ---
     async function requestPermissionsAndStart() {
         startBtn.disabled = true;
+        startMultiBtn.disabled = true;
         permissionStatus.textContent = 'Requesting permissions...';
 
         try {
-            // Request microphone
             permissionStatus.textContent = 'Requesting microphone access...';
             state.mediaStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
@@ -98,14 +152,12 @@
                 },
             });
 
-            // Request camera
             permissionStatus.textContent = 'Requesting camera access...';
             const videoStream = await navigator.mediaDevices.getUserMedia({
                 video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
             });
             cameraFeed.srcObject = videoStream;
 
-            // Request device orientation (iOS requires explicit permission)
             if (typeof DeviceOrientationEvent !== 'undefined' &&
                 typeof DeviceOrientationEvent.requestPermission === 'function') {
                 permissionStatus.textContent = 'Requesting compass access...';
@@ -115,7 +167,6 @@
                 }
             }
 
-            // Request geolocation
             permissionStatus.textContent = 'Getting location...';
             try {
                 const pos = await new Promise((resolve, reject) =>
@@ -124,11 +175,9 @@
                 state.latitude = pos.coords.latitude;
                 state.longitude = pos.coords.longitude;
             } catch {
-                // Location is optional - BirdNET works without it
-                console.warn('Geolocation unavailable, proceeding without location filtering');
+                console.warn('Geolocation unavailable');
             }
 
-            // All permissions granted - switch to app screen
             startScreen.classList.remove('active');
             appScreen.classList.add('active');
 
@@ -141,6 +190,7 @@
         } catch (err) {
             permissionStatus.textContent = 'Error: ' + err.message;
             startBtn.disabled = false;
+            startMultiBtn.disabled = false;
         }
     }
 
@@ -152,13 +202,10 @@
 
         const source = state.audioContext.createMediaStreamSource(state.mediaStream);
 
-        // Analyser for frequency visualization
         state.analyser = state.audioContext.createAnalyser();
         state.analyser.fftSize = 256;
         source.connect(state.analyser);
 
-        // ScriptProcessor for capturing PCM data to send to server
-        // (AudioWorklet would be preferred but ScriptProcessor is simpler and widely supported)
         const bufferSize = 4096;
         const processor = state.audioContext.createScriptProcessor(bufferSize, 1, 1);
 
@@ -189,7 +236,6 @@
         if (!state.wsConnection || state.wsConnection.readyState !== WebSocket.OPEN) return;
         if (state.audioChunkBuffer.length === 0) return;
 
-        // Merge recent buffer into a single chunk
         const totalSamples = state.audioChunkBuffer.reduce((sum, c) => sum + c.pcm.length, 0);
         const merged = new Float32Array(totalSamples);
         let offset = 0;
@@ -198,21 +244,17 @@
             offset += chunk.pcm.length;
         }
 
-        // Get the average heading from chunks
         const avgHeading = averageHeading(state.audioChunkBuffer.map((c) => c.heading));
-
-        // Convert Float32 to Int16 for smaller payload
         const int16 = float32ToInt16(merged);
-        const base64 = arrayBufferToBase64(int16.buffer);
+        const base64Data = arrayBufferToBase64(int16.buffer);
 
         state.wsConnection.send(JSON.stringify({
             type: 'audio_chunk',
-            data: base64,
+            data: base64Data,
             sample_rate: state.audioContext.sampleRate,
             heading: Math.round(avgHeading * 10) / 10,
         }));
 
-        // Keep a sliding window of SEND_BUFFER_SECONDS
         const cutoff = Date.now() - SEND_BUFFER_SECONDS * 1000;
         state.audioChunkBuffer = state.audioChunkBuffer.filter((c) => c.timestamp > cutoff);
     }
@@ -247,10 +289,9 @@
         return (avg + 360) % 360;
     }
 
-    // --- Compass / Device Orientation ---
+    // --- Compass ---
     function initCompass() {
         window.addEventListener('deviceorientation', (e) => {
-            // webkitCompassHeading for iOS, alpha for Android
             let heading;
             if (e.webkitCompassHeading !== undefined) {
                 heading = e.webkitCompassHeading;
@@ -263,40 +304,45 @@
             compassHeading.textContent = Math.round(heading) + '\u00B0';
         });
 
-        // Fallback: if no compass events after 2s, show manual heading info
         setTimeout(() => {
-            if (state.currentHeading === 0) {
-                compassHeading.textContent = 'No compass';
-            }
+            if (state.currentHeading === 0) compassHeading.textContent = 'No compass';
         }, 2000);
     }
 
-    // --- WebSocket Connection ---
+    // --- WebSocket ---
     function connectWebSocket() {
         const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${location.host}/ws/audio`;
+        const wsUrl = protocol + '//' + location.host + '/ws/audio';
 
         setConnectionStatus('connecting');
-
         const ws = new WebSocket(wsUrl);
         state.wsConnection = ws;
 
         ws.onopen = () => {
             setConnectionStatus('connected');
-            // Send config with location
             ws.send(JSON.stringify({
                 type: 'config',
                 latitude: state.latitude,
                 longitude: state.longitude,
+                enable_separation: state.enableSeparation,
             }));
+
+            // Join room if one was configured
+            if (state.roomId) {
+                state.deviceId = 'dev-' + Math.random().toString(36).substr(2, 6);
+                ws.send(JSON.stringify({
+                    type: 'join_room',
+                    room_id: state.roomId,
+                    device_id: state.deviceId,
+                }));
+            }
         };
 
         ws.onmessage = (event) => {
             try {
-                const msg = JSON.parse(event.data);
-                handleServerMessage(msg);
+                handleServerMessage(JSON.parse(event.data));
             } catch (err) {
-                console.error('Failed to parse server message:', err);
+                console.error('Parse error:', err);
             }
         };
 
@@ -320,65 +366,148 @@
     }
 
     function handleServerMessage(msg) {
+        // Single bird detection
         if (msg.type === 'detection' && msg.detections && msg.detections.length > 0) {
-            const top = msg.detections[0];
-            state.detectedSpecies = top.species;
-            state.targetConfidence = top.confidence;
+            handleSingleDetection(msg);
+        }
+
+        // Multi-bird detection (source separation)
+        if (msg.type === 'multi_detection' && msg.birds) {
+            handleMultiDetection(msg);
+        }
+
+        // Multi-device triangulation result
+        if (msg.type === 'triangulation' && msg.result) {
+            handleTriangulation(msg);
+        }
+
+        // Stereo direction
+        if (msg.type === 'stereo_direction' && msg.direction) {
+            state.targetHeading = msg.direction.heading;
+            state.targetConfidence = msg.direction.confidence;
             state.lastDetectionTime = Date.now();
+        }
 
-            if (msg.direction && msg.direction.heading !== undefined) {
-                state.targetHeading = msg.direction.heading;
-            }
+        // Room joined
+        if (msg.type === 'room_joined') {
+            statusText.textContent = 'Room ' + msg.room_id + ' (' + msg.device_count + ' devices)';
+        }
 
-            // Update detection panel
-            speciesName.textContent = top.species;
-            speciesConfidence.textContent = `${Math.round(top.confidence * 100)}% confidence`;
-
-            if (state.targetHeading !== null) {
-                const dir = getCardinalDirection(state.targetHeading);
-                directionInfo.textContent = `Direction: ${dir} (${Math.round(state.targetHeading)}\u00B0)`;
-            } else {
-                directionInfo.textContent = 'Direction: Scanning...';
-            }
-
-            detectionPanel.classList.remove('hidden');
-
-            // Add to history
-            state.detections.unshift({
-                species: top.species,
-                confidence: top.confidence,
-                heading: state.targetHeading,
-                time: new Date(),
-            });
-            if (state.detections.length > 50) state.detections.pop();
-            updateHistoryList();
-
-            // Show additional detections in the panel
-            if (msg.detections.length > 1) {
-                const others = msg.detections.slice(1, 3).map(
-                    (d) => `${d.species} (${Math.round(d.confidence * 100)}%)`
-                ).join(', ');
-                directionInfo.textContent += ' | Also: ' + others;
-            }
-
-        } else if (msg.type === 'status') {
+        if (msg.type === 'status') {
             statusText.textContent = msg.message || 'Listening...';
         }
     }
 
-    function getCardinalDirection(heading) {
-        const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
-        const idx = Math.round(heading / 45) % 8;
-        return dirs[idx];
+    function handleSingleDetection(msg) {
+        const top = msg.detections[0];
+        state.detectedSpecies = top.species;
+        state.targetConfidence = top.confidence;
+        state.lastDetectionTime = Date.now();
+
+        if (msg.direction && msg.direction.heading !== undefined) {
+            state.targetHeading = msg.direction.heading;
+        }
+
+        speciesName.textContent = top.species;
+        speciesConfidence.textContent = Math.round(top.confidence * 100) + '% confidence';
+
+        if (state.targetHeading !== null) {
+            const dir = getCardinalDirection(state.targetHeading);
+            directionInfo.textContent = 'Direction: ' + dir + ' (' + Math.round(state.targetHeading) + '\u00B0)';
+        } else {
+            directionInfo.textContent = 'Direction: Scanning...';
+        }
+
+        detectionPanel.classList.remove('hidden');
+        multiDetectionPanel.classList.add('hidden');
+
+        state.detections.unshift({
+            species: top.species,
+            confidence: top.confidence,
+            heading: state.targetHeading,
+            time: new Date(),
+        });
+        if (state.detections.length > 50) state.detections.pop();
+        updateHistoryList();
+
+        if (msg.detections.length > 1) {
+            const others = msg.detections.slice(1, 3).map(
+                (d) => d.species + ' (' + Math.round(d.confidence * 100) + '%)'
+            ).join(', ');
+            directionInfo.textContent += ' | Also: ' + others;
+        }
     }
 
-    // --- UI Interactions ---
+    function handleMultiDetection(msg) {
+        state.activeBirds = msg.birds;
+        state.lastDetectionTime = Date.now();
+
+        detectionPanel.classList.add('hidden');
+        multiDetectionPanel.classList.remove('hidden');
+        sourceCount.textContent = msg.source_count || msg.birds.length;
+
+        birdList.innerHTML = msg.birds.map((bird, idx) => {
+            const color = BIRD_COLORS[idx % BIRD_COLORS.length];
+            const headingStr = bird.heading !== undefined
+                ? getCardinalDirection(bird.heading) + ' ' + Math.round(bird.heading) + '\u00B0'
+                : 'scanning...';
+            const freqStr = bird.freq_range
+                ? (bird.freq_range[0] / 1000).toFixed(1) + '-' + (bird.freq_range[1] / 1000).toFixed(1) + ' kHz'
+                : '';
+
+            return '<div class="bird-item">' +
+                '<div class="bird-color-dot" style="background:' + color + '"></div>' +
+                '<div class="bird-info">' +
+                '<div class="bird-species" style="color:' + color + '">' + escapeHtml(bird.species) + '</div>' +
+                '<div class="bird-meta">' + Math.round(bird.confidence * 100) + '% | ' + freqStr + '</div>' +
+                '</div>' +
+                '<div class="bird-direction">' + headingStr + '</div>' +
+                '</div>';
+        }).join('');
+
+        // Add all to history
+        for (const bird of msg.birds) {
+            state.detections.unshift({
+                species: bird.species,
+                confidence: bird.confidence,
+                heading: bird.heading || null,
+                time: new Date(),
+            });
+        }
+        if (state.detections.length > 50) state.detections.length = 50;
+        updateHistoryList();
+    }
+
+    function handleTriangulation(msg) {
+        state.triangulation = msg.result;
+        state.lastDetectionTime = Date.now();
+        triangulationPanel.classList.remove('hidden');
+
+        const r = msg.result;
+        const dir = getCardinalDirection(r.bearing);
+        triBearing.textContent = dir + ' ' + Math.round(r.bearing) + '\u00B0';
+        triDistance.textContent = r.distance > 0 ? 'Distance: ~' + r.distance + 'm' : 'Distance: estimating...';
+
+        const deviceCount = msg.devices ? msg.devices.length : '?';
+        triDevices.textContent = deviceCount + ' devices | Confidence: ' + Math.round(r.confidence * 100) + '%';
+
+        // Use triangulation bearing as the target heading
+        state.targetHeading = r.bearing;
+        state.targetConfidence = r.confidence;
+    }
+
+    function getCardinalDirection(heading) {
+        const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+        return dirs[Math.round(heading / 45) % 8];
+    }
+
+    // --- UI ---
     function toggleListening() {
         state.isListening = !state.isListening;
         listenBtn.classList.toggle('active', state.isListening);
 
         if (state.isListening) {
-            statusText.textContent = 'Listening...';
+            statusText.textContent = state.enableSeparation ? 'Listening (multi-bird)...' : 'Listening...';
             if (state.audioContext && state.audioContext.state === 'suspended') {
                 state.audioContext.resume();
             }
@@ -386,6 +515,8 @@
             statusText.textContent = 'Paused';
             state.audioChunkBuffer = [];
             detectionPanel.classList.add('hidden');
+            multiDetectionPanel.classList.add('hidden');
+            triangulationPanel.classList.add('hidden');
         }
     }
 
@@ -393,10 +524,7 @@
         state.isScanMode = !state.isScanMode;
         scanBtn.classList.toggle('active', state.isScanMode);
         scanIndicator.classList.toggle('hidden', !state.isScanMode);
-
-        if (state.isScanMode && !state.isListening) {
-            toggleListening();
-        }
+        if (state.isScanMode && !state.isListening) toggleListening();
     }
 
     function updateHistoryList() {
@@ -404,19 +532,13 @@
             historyList.innerHTML = '<div class="empty-history">No detections yet. Start listening to identify birds!</div>';
             return;
         }
-
         historyList.innerHTML = state.detections.map((d) => {
             const timeStr = d.time.toLocaleTimeString();
-            const headingStr = d.heading !== null ? ` | ${Math.round(d.heading)}\u00B0` : '';
-            return `
-                <div class="history-item">
-                    <div>
-                        <div class="species">${escapeHtml(d.species)}</div>
-                        <div class="meta">${timeStr}${headingStr}</div>
-                    </div>
-                    <div class="confidence-badge">${Math.round(d.confidence * 100)}%</div>
-                </div>
-            `;
+            const headingStr = d.heading !== null ? ' | ' + Math.round(d.heading) + '\u00B0' : '';
+            return '<div class="history-item">' +
+                '<div><div class="species">' + escapeHtml(d.species) + '</div>' +
+                '<div class="meta">' + timeStr + headingStr + '</div></div>' +
+                '<div class="confidence-badge">' + Math.round(d.confidence * 100) + '%</div></div>';
         }).join('');
     }
 
@@ -438,32 +560,69 @@
         const h = window.innerHeight;
         ctx.clearRect(0, 0, w, h);
 
-        // Fade out detection after DETECTION_FADE_MS
         if (state.lastDetectionTime && Date.now() - state.lastDetectionTime > DETECTION_FADE_MS) {
             state.targetHeading = null;
             state.detectedSpecies = null;
+            state.activeBirds = [];
             detectionPanel.classList.add('hidden');
+            multiDetectionPanel.classList.add('hidden');
+            triangulationPanel.classList.add('hidden');
         }
 
-        if (state.targetHeading === null || !state.isListening) return;
-
-        // Compute relative angle between current heading and target
-        let relativeAngle = state.targetHeading - state.currentHeading;
-        // Normalize to -180 to 180
-        while (relativeAngle > 180) relativeAngle -= 360;
-        while (relativeAngle < -180) relativeAngle += 360;
+        if (!state.isListening) return;
 
         const cx = w / 2;
         const cy = h / 2;
 
-        // Draw directional arrow
+        // Draw center reticle always when listening
+        drawReticle(cx, cy);
+
+        // Multi-bird mode: draw individual arrows for each bird
+        if (state.activeBirds.length > 0) {
+            state.activeBirds.forEach((bird, idx) => {
+                if (bird.heading === undefined) return;
+                const color = BIRD_COLORS[idx % BIRD_COLORS.length];
+                drawBirdArrow(cx, cy, bird.heading, bird.confidence || 0.5, color, bird.species, w, h);
+            });
+        }
+        // Single bird / triangulation arrow
+        else if (state.targetHeading !== null) {
+            drawBirdArrow(cx, cy, state.targetHeading, state.targetConfidence, '#4ecdc4', state.detectedSpecies, w, h);
+        }
+
+        // Scan ring
+        if (state.isScanMode && state.scanAmplitudes) {
+            drawScanRing(cx, cy, Math.min(w, h) * 0.42);
+        }
+    }
+
+    function drawReticle(cx, cy) {
+        const size = 30;
+        ctx.strokeStyle = 'rgba(78, 205, 196, 0.4)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(cx, cy, size, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(cx - size - 5, cy); ctx.lineTo(cx - size + 10, cy);
+        ctx.moveTo(cx + size + 5, cy); ctx.lineTo(cx + size - 10, cy);
+        ctx.moveTo(cx, cy - size - 5); ctx.lineTo(cx, cy - size + 10);
+        ctx.moveTo(cx, cy + size + 5); ctx.lineTo(cx, cy + size - 10);
+        ctx.stroke();
+    }
+
+    function drawBirdArrow(cx, cy, targetHeading, confidence, color, label, w, h) {
+        let relativeAngle = targetHeading - state.currentHeading;
+        while (relativeAngle > 180) relativeAngle -= 360;
+        while (relativeAngle < -180) relativeAngle += 360;
+
         const arrowAngleRad = ((relativeAngle - 90) * Math.PI) / 180;
         const arrowLength = Math.min(w, h) * 0.3;
         const arrowX = cx + Math.cos(arrowAngleRad) * arrowLength;
         const arrowY = cy + Math.sin(arrowAngleRad) * arrowLength;
 
-        // Arrow line
-        ctx.strokeStyle = `rgba(78, 205, 196, ${0.5 + state.targetConfidence * 0.5})`;
+        // Dashed line
+        ctx.strokeStyle = color + (Math.round((0.5 + confidence * 0.5) * 255)).toString(16).padStart(2, '0');
         ctx.lineWidth = 3;
         ctx.setLineDash([8, 4]);
         ctx.beginPath();
@@ -475,7 +634,7 @@
         // Arrowhead
         const headLen = 20;
         const headAngle = Math.atan2(arrowY - cy, arrowX - cx);
-        ctx.fillStyle = '#4ecdc4';
+        ctx.fillStyle = color;
         ctx.beginPath();
         ctx.moveTo(arrowX, arrowY);
         ctx.lineTo(
@@ -489,60 +648,40 @@
         ctx.closePath();
         ctx.fill();
 
-        // Center crosshair / target reticle
-        const reticleSize = 30;
-        ctx.strokeStyle = 'rgba(78, 205, 196, 0.4)';
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.arc(cx, cy, reticleSize, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(cx - reticleSize - 5, cy);
-        ctx.lineTo(cx - reticleSize + 10, cy);
-        ctx.moveTo(cx + reticleSize + 5, cy);
-        ctx.lineTo(cx + reticleSize - 10, cy);
-        ctx.moveTo(cx, cy - reticleSize - 5);
-        ctx.lineTo(cx, cy - reticleSize + 10);
-        ctx.moveTo(cx, cy + reticleSize + 5);
-        ctx.lineTo(cx, cy + reticleSize - 10);
-        ctx.stroke();
+        // Label near arrowhead
+        if (label) {
+            ctx.fillStyle = color;
+            ctx.font = 'bold 11px system-ui';
+            ctx.textAlign = 'center';
+            const labelX = arrowX + Math.cos(arrowAngleRad) * 20;
+            const labelY = arrowY + Math.sin(arrowAngleRad) * 20;
+            ctx.fillText(label, labelX, labelY);
+        }
 
-        // If the bird is roughly ahead (within 15 degrees), highlight green
+        // Highlight when bird is ahead
         if (Math.abs(relativeAngle) < 15) {
             ctx.strokeStyle = '#2ecc71';
             ctx.lineWidth = 3;
             ctx.beginPath();
-            ctx.arc(cx, cy, reticleSize + 10, 0, Math.PI * 2);
+            ctx.arc(cx, cy, 40, 0, Math.PI * 2);
             ctx.stroke();
-
             ctx.fillStyle = 'rgba(46, 204, 113, 0.8)';
             ctx.font = 'bold 14px system-ui';
             ctx.textAlign = 'center';
-            ctx.fillText('BIRD AHEAD', cx, cy + reticleSize + 30);
-        }
-
-        // Compass ring around edge showing scan amplitudes
-        if (state.isScanMode && state.scanAmplitudes) {
-            drawScanRing(cx, cy, Math.min(w, h) * 0.42);
+            ctx.fillText('BIRD AHEAD', cx, cy + 55);
         }
     }
 
     function drawScanRing(cx, cy, radius) {
         if (!state.scanAmplitudes) return;
         const maxAmp = Math.max(...state.scanAmplitudes.map((a) => a.rms), 0.001);
-
         for (const amp of state.scanAmplitudes) {
             const angleRad = ((amp.heading - state.currentHeading - 90) * Math.PI) / 180;
             const intensity = amp.rms / maxAmp;
             const dotRadius = 3 + intensity * 8;
-
-            ctx.fillStyle = `rgba(243, 156, 18, ${0.3 + intensity * 0.7})`;
+            ctx.fillStyle = 'rgba(243, 156, 18, ' + (0.3 + intensity * 0.7) + ')';
             ctx.beginPath();
-            ctx.arc(
-                cx + Math.cos(angleRad) * radius,
-                cy + Math.sin(angleRad) * radius,
-                dotRadius, 0, Math.PI * 2
-            );
+            ctx.arc(cx + Math.cos(angleRad) * radius, cy + Math.sin(angleRad) * radius, dotRadius, 0, Math.PI * 2);
             ctx.fill();
         }
     }
@@ -552,38 +691,29 @@
             freqCtx.clearRect(0, 0, freqCanvas.width, freqCanvas.height);
             return;
         }
-
         const bufferLength = state.analyser.frequencyBinCount;
         const dataArray = new Uint8Array(bufferLength);
         state.analyser.getByteFrequencyData(dataArray);
-
         const w = freqCanvas.width;
         const h = freqCanvas.height;
         freqCtx.clearRect(0, 0, w, h);
-
         const barWidth = w / bufferLength * 2;
         let x = 0;
-
         for (let i = 0; i < bufferLength; i++) {
             const barHeight = (dataArray[i] / 255) * h;
             const hue = 170 + (dataArray[i] / 255) * 30;
-            freqCtx.fillStyle = `hsla(${hue}, 70%, 60%, 0.6)`;
+            freqCtx.fillStyle = 'hsla(' + hue + ', 70%, 60%, 0.6)';
             freqCtx.fillRect(x, h - barHeight, barWidth - 1, barHeight);
             x += barWidth;
             if (x > w) break;
         }
     }
 
-    // --- Service Worker ---
     function registerServiceWorker() {
         if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.register('/static/sw.js').catch((err) => {
-                console.warn('Service worker registration failed:', err);
-            });
+            navigator.serviceWorker.register('/static/sw.js').catch(() => {});
         }
     }
 
-    // Initial history render
     updateHistoryList();
-
 })();

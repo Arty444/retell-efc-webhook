@@ -13,7 +13,9 @@ from fastapi.staticfiles import StaticFiles
 from supabase import create_client, Client
 
 from bird_analyzer import analyze_audio
-from audio_direction import estimate_direction
+from audio_direction import estimate_direction, estimate_direction_stereo, estimate_directions_multi_source
+from sound_separation import separate_sources
+from multi_device_locator import DeviceRoom
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -226,6 +228,9 @@ async def crm_webhook(request: Request):
 
 # ─── Bird Sound Locator ────────────────────────────────────────────────────────
 
+# Multi-device rooms for TDOA triangulation
+device_rooms: dict[str, DeviceRoom] = {}
+
 
 @app.get("/app", response_class=HTMLResponse)
 async def bird_locator_app():
@@ -234,44 +239,116 @@ async def bird_locator_app():
     return HTMLResponse(content=index_path.read_text(), status_code=200)
 
 
+@app.post("/api/room/create")
+async def create_room():
+    """Create a new multi-device room for triangulation."""
+    room = DeviceRoom()
+    device_rooms[room.room_id] = room
+    return {"room_id": room.room_id}
+
+
+@app.get("/api/room/{room_id}")
+async def get_room_info(room_id: str):
+    """Get info about a multi-device room."""
+    room = device_rooms.get(room_id)
+    if not room:
+        return {"error": "Room not found"}
+    return {
+        "room_id": room.room_id,
+        "device_count": room.get_device_count(),
+        "devices": room.get_device_positions(),
+        "can_localize": room.can_localize(),
+    }
+
+
 @app.websocket("/ws/audio")
 async def audio_websocket(websocket: WebSocket):
     """
     WebSocket endpoint for real-time bird sound analysis.
 
     Protocol:
-    - Client sends: {"type": "config", "latitude": float, "longitude": float}
-    - Client sends: {"type": "audio_chunk", "data": "<base64 Int16 PCM>", "sample_rate": int, "heading": float}
-    - Server sends: {"type": "detection", "detections": [...], "direction": {...}}
-    - Server sends: {"type": "status", "message": str}
+    Client sends:
+      {"type": "config", "latitude": float, "longitude": float, "enable_separation": bool}
+      {"type": "audio_chunk", "data": "<base64 Int16 PCM>", "sample_rate": int, "heading": float}
+      {"type": "audio_stereo", "ch1": "<base64>", "ch2": "<base64>", "sample_rate": int, "heading": float}
+      {"type": "join_room", "room_id": str, "device_id": str}
+
+    Server sends:
+      {"type": "detection", "detections": [...], "direction": {...}}
+      {"type": "multi_detection", "birds": [...]}  -- separated sources with individual directions
+      {"type": "triangulation", "result": {...}}    -- multi-device TDOA result
+      {"type": "status", "message": str}
     """
     await websocket.accept()
     logger.info("Bird locator WebSocket connected")
 
     # Per-connection state
-    config = {"latitude": 0.0, "longitude": 0.0}
-    audio_buffer = []  # List of {"pcm": np.ndarray, "heading": float, "timestamp": float}
+    config = {"latitude": 0.0, "longitude": 0.0, "enable_separation": False}
+    audio_buffer = []
     ANALYSIS_WINDOW_SECONDS = 3.0
-    ANALYSIS_INTERVAL_CHUNKS = 4  # Analyze every N chunks received
+    ANALYSIS_INTERVAL_CHUNKS = 4
     chunk_count = 0
+    room_id = None
+    device_id = None
 
     try:
         await websocket.send_json({"type": "status", "message": "Connected. Start listening to detect birds!"})
 
         while True:
             data = await websocket.receive_json()
+            msg_type = data.get("type")
 
-            if data.get("type") == "config":
+            if msg_type == "config":
                 config["latitude"] = float(data.get("latitude", 0))
                 config["longitude"] = float(data.get("longitude", 0))
+                config["enable_separation"] = bool(data.get("enable_separation", False))
+                mode = "multi-bird" if config["enable_separation"] else "single"
                 await websocket.send_json({
                     "type": "status",
-                    "message": f"Location set ({config['latitude']:.1f}, {config['longitude']:.1f})"
+                    "message": f"Location set ({config['latitude']:.1f}, {config['longitude']:.1f}) | Mode: {mode}"
                 })
                 continue
 
-            if data.get("type") == "audio_chunk":
-                # Decode base64 Int16 PCM to float32 numpy array
+            if msg_type == "join_room":
+                room_id = data.get("room_id")
+                device_id = data.get("device_id", f"dev-{id(websocket)}")
+                if room_id and room_id not in device_rooms:
+                    device_rooms[room_id] = DeviceRoom(room_id)
+                if room_id:
+                    room = device_rooms[room_id]
+                    room.add_device(device_id, config["latitude"], config["longitude"])
+                    await websocket.send_json({
+                        "type": "room_joined",
+                        "room_id": room_id,
+                        "device_id": device_id,
+                        "device_count": room.get_device_count(),
+                        "devices": room.get_device_positions(),
+                    })
+                continue
+
+            if msg_type == "audio_stereo":
+                # Stereo mic mode: two channels for ITD-based direction
+                try:
+                    ch1_bytes = base64.b64decode(data["ch1"])
+                    ch2_bytes = base64.b64decode(data["ch2"])
+                    ch1 = np.frombuffer(ch1_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    ch2 = np.frombuffer(ch2_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    sr = int(data.get("sample_rate", 44100))
+                    heading = float(data.get("heading", 0))
+                except Exception as e:
+                    logger.warning("Failed to decode stereo audio: %s", e)
+                    continue
+
+                stereo_dir = estimate_direction_stereo(ch1, ch2, sr, heading)
+                if stereo_dir:
+                    await websocket.send_json({
+                        "type": "stereo_direction",
+                        "direction": stereo_dir,
+                    })
+                continue
+
+            if msg_type == "audio_chunk":
+                # Decode audio
                 try:
                     raw_bytes = base64.b64decode(data["data"])
                     int16_data = np.frombuffer(raw_bytes, dtype=np.int16)
@@ -288,7 +365,29 @@ async def audio_websocket(websocket: WebSocket):
                     "timestamp": datetime.utcnow().timestamp(),
                 })
 
-                # Trim buffer to analysis window
+                # Submit to multi-device room if joined
+                if room_id and room_id in device_rooms and device_id:
+                    room = device_rooms[room_id]
+                    room.submit_audio(device_id, float32_data, datetime.utcnow().timestamp(), sample_rate)
+
+                    if room.can_localize():
+                        tri_result = room.localize()
+                        if tri_result:
+                            await websocket.send_json({
+                                "type": "triangulation",
+                                "result": {
+                                    "bearing": tri_result.bearing,
+                                    "distance": tri_result.distance,
+                                    "latitude": tri_result.latitude,
+                                    "longitude": tri_result.longitude,
+                                    "confidence": tri_result.confidence,
+                                    "x": tri_result.x,
+                                    "y": tri_result.y,
+                                },
+                                "devices": room.get_device_positions(),
+                            })
+
+                # Trim buffer
                 now = datetime.utcnow().timestamp()
                 audio_buffer = [
                     c for c in audio_buffer
@@ -297,54 +396,126 @@ async def audio_websocket(websocket: WebSocket):
 
                 chunk_count += 1
 
-                # Run analysis periodically when we have enough audio
+                # Run analysis periodically
                 if chunk_count % ANALYSIS_INTERVAL_CHUNKS == 0 and len(audio_buffer) >= 2:
-                    # Merge recent audio for BirdNET analysis
                     recent = [c for c in audio_buffer if now - c["timestamp"] < ANALYSIS_WINDOW_SECONDS]
                     if not recent:
                         continue
 
                     merged_pcm = np.concatenate([c["pcm"] for c in recent])
 
-                    # Run BirdNET classification
-                    try:
-                        detections = analyze_audio(
-                            pcm_data=merged_pcm,
-                            sample_rate=sample_rate,
-                            latitude=config["latitude"],
-                            longitude=config["longitude"],
-                            min_confidence=0.25,
+                    if config["enable_separation"]:
+                        # Multi-bird mode: separate sources, classify each, estimate individual directions
+                        await _handle_multi_bird(
+                            websocket, merged_pcm, recent, sample_rate, config
                         )
-                    except Exception as e:
-                        logger.error("BirdNET analysis failed: %s", e)
-                        detections = []
-
-                    # Estimate direction from amplitude across headings
-                    direction = None
-                    try:
-                        direction_chunks = [
-                            {"pcm_data": c["pcm"], "heading": c["heading"]}
-                            for c in recent
-                        ]
-                        direction = estimate_direction(direction_chunks, sample_rate)
-                    except Exception as e:
-                        logger.warning("Direction estimation failed: %s", e)
-
-                    if detections:
-                        response = {
-                            "type": "detection",
-                            "detections": detections,
-                            "direction": direction,
-                        }
-                        await websocket.send_json(response)
-                        logger.info(
-                            "Detected: %s (%.0f%%) heading=%s",
-                            detections[0]["species"],
-                            detections[0]["confidence"] * 100,
-                            direction.get("heading") if direction else "unknown",
+                    else:
+                        # Single-bird mode (original behavior)
+                        await _handle_single_bird(
+                            websocket, merged_pcm, recent, sample_rate, config
                         )
 
     except WebSocketDisconnect:
         logger.info("Bird locator WebSocket disconnected")
+        if room_id and room_id in device_rooms and device_id:
+            device_rooms[room_id].remove_device(device_id)
     except Exception as e:
         logger.error("WebSocket error: %s", e)
+
+
+async def _handle_single_bird(websocket, merged_pcm, recent, sample_rate, config):
+    """Original single-bird detection and direction estimation."""
+    try:
+        detections = analyze_audio(
+            pcm_data=merged_pcm,
+            sample_rate=sample_rate,
+            latitude=config["latitude"],
+            longitude=config["longitude"],
+            min_confidence=0.25,
+        )
+    except Exception as e:
+        logger.error("BirdNET analysis failed: %s", e)
+        detections = []
+
+    direction = None
+    try:
+        direction_chunks = [{"pcm_data": c["pcm"], "heading": c["heading"]} for c in recent]
+        direction = estimate_direction(direction_chunks, sample_rate)
+    except Exception as e:
+        logger.warning("Direction estimation failed: %s", e)
+
+    if detections:
+        await websocket.send_json({
+            "type": "detection",
+            "detections": detections,
+            "direction": direction,
+        })
+        logger.info(
+            "Detected: %s (%.0f%%) heading=%s",
+            detections[0]["species"],
+            detections[0]["confidence"] * 100,
+            direction.get("heading") if direction else "unknown",
+        )
+
+
+async def _handle_multi_bird(websocket, merged_pcm, recent, sample_rate, config):
+    """Separate overlapping bird calls, classify each, estimate individual directions."""
+    # Step 1: Separate sources
+    try:
+        sources = separate_sources(merged_pcm, sample_rate, n_sources=0)
+    except Exception as e:
+        logger.error("Source separation failed: %s", e)
+        # Fall back to single-bird mode
+        await _handle_single_bird(websocket, merged_pcm, recent, sample_rate, config)
+        return
+
+    if not sources:
+        return
+
+    # Step 2: Classify each separated source with BirdNET
+    birds = []
+    for idx, source in enumerate(sources):
+        try:
+            detections = analyze_audio(
+                pcm_data=source["audio"],
+                sample_rate=sample_rate,
+                latitude=config["latitude"],
+                longitude=config["longitude"],
+                min_confidence=0.20,
+            )
+        except Exception:
+            detections = []
+
+        species = detections[0]["species"] if detections else "Unknown bird"
+        confidence = detections[0]["confidence"] if detections else 0.0
+
+        birds.append({
+            "source_idx": idx,
+            "species": species,
+            "confidence": round(confidence, 3),
+            "dominant_freq": source["dominant_freq"],
+            "freq_range": source["freq_range"],
+            "energy": source["energy"],
+        })
+
+    # Step 3: Estimate direction for each source independently
+    try:
+        direction_chunks = [{"pcm_data": c["pcm"], "heading": c["heading"]} for c in recent]
+        source_directions = estimate_directions_multi_source(sources, direction_chunks, sample_rate)
+
+        # Merge direction info into birds
+        for sd in source_directions:
+            idx = sd["source_idx"]
+            if idx < len(birds):
+                birds[idx]["heading"] = sd["heading"]
+                birds[idx]["direction_confidence"] = sd["confidence"]
+    except Exception as e:
+        logger.warning("Multi-source direction estimation failed: %s", e)
+
+    if birds:
+        await websocket.send_json({
+            "type": "multi_detection",
+            "birds": birds,
+            "source_count": len(sources),
+        })
+        logger.info("Multi-bird: %d sources, top: %s", len(birds), birds[0]["species"])

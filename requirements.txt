@@ -7,3 +7,4 @@ birdnetlib>=0.7
 numpy
 scipy
 soundfile
+scikit-learn
