@@ -58,27 +58,23 @@ echo ""
 echo "Using backend: $BACKEND_URL"
 echo ""
 
-# Write the URL into capacitor.config.ts
-cat > capacitor.config.ts << TSEOF
-import type { CapacitorConfig } from '@capacitor/cli';
-
-const config: CapacitorConfig = {
-  appId: 'com.birdlocator.app',
-  appName: 'Bird Sound Locator',
-  webDir: '../static',
-  server: {
-    url: '${BACKEND_URL}',
-    cleartext: true,
+# Write the URL into capacitor.config.json (JSON — no TypeScript needed)
+rm -f capacitor.config.ts
+cat > capacitor.config.json << JSONEOF
+{
+  "appId": "com.birdlocator.app",
+  "appName": "Bird Sound Locator",
+  "webDir": "../static",
+  "server": {
+    "url": "${BACKEND_URL}",
+    "cleartext": true
   },
-  plugins: {},
-  ios: {
-    scheme: 'BirdLocator',
-    backgroundColor: '#1a1a2e',
-  },
-};
-
-export default config;
-TSEOF
+  "ios": {
+    "scheme": "BirdLocator",
+    "backgroundColor": "#1a1a2e"
+  }
+}
+JSONEOF
 
 echo "[OK] Backend URL configured"
 

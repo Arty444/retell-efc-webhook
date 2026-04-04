@@ -1,0 +1,12 @@
+{
+  "appId": "com.birdlocator.app",
+  "appName": "Bird Sound Locator",
+  "webDir": "../static",
+  "server": {
+    "cleartext": true
+  },
+  "ios": {
+    "scheme": "BirdLocator",
+    "backgroundColor": "#1a1a2e"
+  }
+}
