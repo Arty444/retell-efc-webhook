@@ -425,7 +425,7 @@
         return (avg + 360) % 360;
     }
 
-    // --- Compass ---
+    // --- Compass & IMU ---
     function initCompass() {
         window.addEventListener('deviceorientation', (e) => {
             let heading;
@@ -437,11 +437,40 @@
                 return;
             }
             state.currentHeading = heading;
-            // Capture pitch and roll for mic axis orientation mapping
-            if (e.beta !== null) state.devicePitch = e.beta;   // -180 to 180 (90 = upright)
-            if (e.gamma !== null) state.deviceRoll = e.gamma;  // -90 to 90 (0 = portrait)
+            if (e.beta !== null) state.devicePitch = e.beta;
+            if (e.gamma !== null) state.deviceRoll = e.gamma;
             compassHeading.textContent = Math.round(heading) + '\u00B0';
         });
+
+        // IMU: accelerometer + gyroscope for acoustic SLAM dead reckoning
+        if (window.DeviceMotionEvent) {
+            var lastImuSend = 0;
+            var IMU_SEND_INTERVAL = 100; // 10 Hz
+            window.addEventListener('devicemotion', function(e) {
+                if (!state.isListening || !state.wsConnection ||
+                    state.wsConnection.readyState !== WebSocket.OPEN) return;
+
+                var now = Date.now();
+                if (now - lastImuSend < IMU_SEND_INTERVAL) return;
+                lastImuSend = now;
+
+                var accel = e.accelerationIncludingGravity || {};
+                var gyro = e.rotationRate || {};
+                state.wsConnection.send(JSON.stringify({
+                    type: 'imu_data',
+                    timestamp: now / 1000,
+                    accel_x: accel.x || 0,
+                    accel_y: accel.y || 0,
+                    accel_z: accel.z || 0,
+                    gyro_x: (gyro.alpha || 0) * Math.PI / 180,
+                    gyro_y: (gyro.beta || 0) * Math.PI / 180,
+                    gyro_z: (gyro.gamma || 0) * Math.PI / 180,
+                    heading: state.currentHeading,
+                    pitch: state.devicePitch,
+                    roll: state.deviceRoll,
+                }));
+            });
+        }
 
         setTimeout(() => {
             if (state.currentHeading === 0) compassHeading.textContent = 'No compass';
@@ -540,13 +569,17 @@
             state.targetElevation = msg.direction.elevation || 0;
             state.micChannel = '4mic-3d';
             state.lastDetectionTime = Date.now();
+            if (msg.distance) state.distanceInfo = msg.distance;
 
             if (!detectionPanel.classList.contains('hidden')) {
                 var dir = getCardinalDirection(msg.direction.heading);
                 var elevStr = Math.round(msg.direction.elevation) !== 0
                     ? ' | Elev: ' + Math.round(msg.direction.elevation) + '\u00B0' : '';
+                var distStr = msg.distance && msg.distance.distance
+                    ? ' | ~' + msg.distance.distance + 'm' : '';
                 directionInfo.textContent = 'Direction: ' + dir +
                     ' (' + Math.round(msg.direction.heading) + '\u00B0)' + elevStr +
+                    distStr +
                     ' [' + (msg.mic_count || '?') + ' mics, ' +
                     (msg.direction.n_pairs_used || '?') + ' pairs]';
             }
@@ -559,16 +592,24 @@
             state.targetElevation = msg.direction.elevation || 0;
             state.micChannel = msg.direction.mic_channel || 'unknown';
             state.lastDetectionTime = Date.now();
+            if (msg.distance) state.distanceInfo = msg.distance;
 
-            // Update direction info if detection panel is showing
             if (!detectionPanel.classList.contains('hidden')) {
                 var dir = getCardinalDirection(msg.direction.heading);
                 var elevStr = msg.direction.elevation !== 0
                     ? ' | Elev: ' + Math.round(msg.direction.elevation) + '\u00B0' : '';
+                var distStr = msg.distance && msg.distance.distance
+                    ? ' | ~' + msg.distance.distance + 'm' : '';
                 directionInfo.textContent = 'Direction: ' + dir +
                     ' (' + Math.round(msg.direction.heading) + '\u00B0)' + elevStr +
+                    distStr +
                     ' | ITD: ' + msg.direction.itd_us + '\u00B5s';
             }
+        }
+
+        // Visual detection (camera-based bird detection)
+        if (msg.type === 'visual_detection') {
+            if (msg.distance) state.distanceInfo = msg.distance;
         }
 
         // Room joined
@@ -586,17 +627,29 @@
         state.detectedSpecies = top.species;
         state.targetConfidence = top.confidence;
         state.lastDetectionTime = Date.now();
+        state.distanceInfo = msg.distance || null;
 
         if (msg.direction && msg.direction.heading !== undefined) {
             state.targetHeading = msg.direction.heading;
         }
 
         speciesName.textContent = top.species;
-        speciesConfidence.textContent = Math.round(top.confidence * 100) + '% confidence';
+        var confText = Math.round(top.confidence * 100) + '% confidence';
+        if (msg.distance && msg.distance.distance) {
+            confText += ' | ~' + msg.distance.distance + 'm away';
+            if (msg.distance.confidence > 0) {
+                confText += ' (\u00B1' + (msg.distance.uncertainty || '?') + 'm)';
+            }
+        }
+        speciesConfidence.textContent = confText;
 
         if (state.targetHeading !== null) {
             const dir = getCardinalDirection(state.targetHeading);
-            directionInfo.textContent = 'Direction: ' + dir + ' (' + Math.round(state.targetHeading) + '\u00B0)';
+            var dirText = 'Direction: ' + dir + ' (' + Math.round(state.targetHeading) + '\u00B0)';
+            if (msg.distance && msg.distance.methods_used && msg.distance.methods_used.length > 0) {
+                dirText += ' | Methods: ' + msg.distance.methods_used.join(', ');
+            }
+            directionInfo.textContent = dirText;
         } else {
             directionInfo.textContent = 'Direction: Scanning...';
         }
@@ -608,6 +661,7 @@
             species: top.species,
             confidence: top.confidence,
             heading: state.targetHeading,
+            distance: msg.distance ? msg.distance.distance : null,
             time: new Date(),
         });
         if (state.detections.length > 50) state.detections.pop();
@@ -624,10 +678,16 @@
     function handleMultiDetection(msg) {
         state.activeBirds = msg.birds;
         state.lastDetectionTime = Date.now();
+        state.distanceInfo = msg.distance || null;
 
         detectionPanel.classList.add('hidden');
         multiDetectionPanel.classList.remove('hidden');
-        sourceCount.textContent = msg.source_count || msg.birds.length;
+
+        var countText = (msg.source_count || msg.birds.length);
+        if (msg.distance && msg.distance.distance) {
+            countText += ' | ~' + msg.distance.distance + 'm';
+        }
+        sourceCount.textContent = countText;
 
         birdList.innerHTML = msg.birds.map((bird, idx) => {
             const color = BIRD_COLORS[idx % BIRD_COLORS.length];
@@ -720,9 +780,10 @@
         historyList.innerHTML = state.detections.map((d) => {
             const timeStr = d.time.toLocaleTimeString();
             const headingStr = d.heading !== null ? ' | ' + Math.round(d.heading) + '\u00B0' : '';
+            const distStr = d.distance ? ' | ~' + d.distance + 'm' : '';
             return '<div class="history-item">' +
                 '<div><div class="species">' + escapeHtml(d.species) + '</div>' +
-                '<div class="meta">' + timeStr + headingStr + '</div></div>' +
+                '<div class="meta">' + timeStr + headingStr + distStr + '</div></div>' +
                 '<div class="confidence-badge">' + Math.round(d.confidence * 100) + '%</div></div>';
         }).join('');
     }
@@ -773,6 +834,11 @@
         // Single bird / triangulation arrow
         else if (state.targetHeading !== null) {
             drawBirdArrow(cx, cy, state.targetHeading, state.targetConfidence, '#4ecdc4', state.detectedSpecies, w, h);
+        }
+
+        // Draw distance info overlay
+        if (state.distanceInfo && state.distanceInfo.distance && state.isListening) {
+            drawDistanceOverlay(w, h);
         }
 
         // Scan ring
@@ -855,6 +921,39 @@
             ctx.textAlign = 'center';
             ctx.fillText('BIRD AHEAD', cx, cy + 55);
         }
+    }
+
+    function drawDistanceOverlay(w, h) {
+        var d = state.distanceInfo;
+        if (!d || !d.distance) return;
+
+        var x = w - 10;
+        var y = 100;
+
+        ctx.textAlign = 'right';
+
+        // Distance value
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+        ctx.fillRect(x - 160, y - 18, 165, 65);
+        ctx.fillStyle = '#4ecdc4';
+        ctx.font = 'bold 22px system-ui';
+        ctx.fillText('~' + d.distance + 'm', x - 5, y + 5);
+
+        // Confidence bar
+        var conf = d.confidence || 0;
+        ctx.fillStyle = '#333';
+        ctx.fillRect(x - 155, y + 15, 150, 6);
+        var barColor = conf > 0.6 ? '#2ecc71' : conf > 0.3 ? '#f39c12' : '#e74c3c';
+        ctx.fillStyle = barColor;
+        ctx.fillRect(x - 155, y + 15, 150 * conf, 6);
+
+        // Methods used
+        ctx.fillStyle = 'rgba(255,255,255,0.5)';
+        ctx.font = '10px system-ui';
+        var methods = d.methods_used ? d.methods_used.join(' + ') : '';
+        ctx.fillText(methods, x - 5, y + 38);
+
+        ctx.textAlign = 'left';
     }
 
     function drawScanRing(cx, cy, radius) {

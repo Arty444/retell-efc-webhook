@@ -604,3 +604,10 @@ body {
     color: #666;
     font-size: 0.9rem;
 }
+
+/* Distance info bar */
+.distance-bar {
+    margin-top: 4px;
+    font-size: 0.75rem;
+    color: rgba(78, 205, 196, 0.7);
+}
