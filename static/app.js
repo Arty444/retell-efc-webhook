@@ -146,52 +146,72 @@
         permissionStatus.textContent = 'Requesting permissions...';
 
         try {
-            permissionStatus.textContent = 'Requesting microphone access...';
-            // Request maximum mic channels (iPhone 16 PM has 4 mics)
-            // Web Audio API may expose 2+ channels depending on browser/OS
-            var micChannels = 1;
-            for (var tryChannels = 4; tryChannels >= 2; tryChannels--) {
-                try {
-                    state.mediaStream = await navigator.mediaDevices.getUserMedia({
-                        audio: {
-                            echoCancellation: false,
-                            noiseSuppression: false,
-                            autoGainControl: false,
-                            sampleRate: 44100,
-                            channelCount: { ideal: tryChannels, min: 1 },
-                        },
-                    });
-                    var audioTrack = state.mediaStream.getAudioTracks()[0];
-                    var settings = audioTrack.getSettings();
-                    micChannels = settings.channelCount || 1;
-                    break;
-                } catch (e) {
-                    if (tryChannels === 2) {
-                        // Final fallback to mono
+            // Check if native Capacitor mic bridge will handle audio
+            var isNative = typeof window.Capacitor !== 'undefined' && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+
+            if (!isNative && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                permissionStatus.textContent = 'Requesting microphone access...';
+                // Request maximum mic channels (iPhone 16 PM has 4 mics)
+                // Web Audio API may expose 2+ channels depending on browser/OS
+                var micChannels = 1;
+                for (var tryChannels = 4; tryChannels >= 2; tryChannels--) {
+                    try {
                         state.mediaStream = await navigator.mediaDevices.getUserMedia({
                             audio: {
                                 echoCancellation: false,
                                 noiseSuppression: false,
                                 autoGainControl: false,
                                 sampleRate: 44100,
+                                channelCount: { ideal: tryChannels, min: 1 },
                             },
                         });
-                        micChannels = 1;
+                        var audioTrack = state.mediaStream.getAudioTracks()[0];
+                        var settings = audioTrack.getSettings();
+                        micChannels = settings.channelCount || 1;
+                        break;
+                    } catch (e) {
+                        if (tryChannels === 2) {
+                            // Final fallback to mono
+                            state.mediaStream = await navigator.mediaDevices.getUserMedia({
+                                audio: {
+                                    echoCancellation: false,
+                                    noiseSuppression: false,
+                                    autoGainControl: false,
+                                    sampleRate: 44100,
+                                },
+                            });
+                            micChannels = 1;
+                        }
                     }
                 }
+                state.micCount = micChannels;
+                state.hasStereo = micChannels >= 2;
+                var micMsg = micChannels >= 4 ? '4 mics detected! Full 3D localization.'
+                           : micChannels >= 2 ? micChannels + ' mics detected. Stereo direction.'
+                           : 'Mono mic. Use scan mode for direction.';
+                permissionStatus.textContent = micMsg;
+            } else if (isNative) {
+                permissionStatus.textContent = 'Native mic capture — waiting for bridge...';
+                state.micCount = 4;  // Native bridge will detect actual count
+                state.hasStereo = true;
+            } else {
+                permissionStatus.textContent = 'Microphone API not available';
+                state.micCount = 1;
+                state.hasStereo = false;
             }
-            state.micCount = micChannels;
-            state.hasStereo = micChannels >= 2;
-            var micMsg = micChannels >= 4 ? '4 mics detected! Full 3D localization.'
-                       : micChannels >= 2 ? micChannels + ' mics detected. Stereo direction.'
-                       : 'Mono mic. Use scan mode for direction.';
-            permissionStatus.textContent = micMsg;
 
-            permissionStatus.textContent = 'Requesting camera access...';
-            const videoStream = await navigator.mediaDevices.getUserMedia({
-                video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
-            });
-            cameraFeed.srcObject = videoStream;
+            // Request camera (skip if mediaDevices not available)
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                try {
+                    permissionStatus.textContent = 'Requesting camera access...';
+                    const videoStream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
+                    });
+                    cameraFeed.srcObject = videoStream;
+                } catch (camErr) {
+                    console.warn('Camera not available:', camErr);
+                }
+            }
 
             if (typeof DeviceOrientationEvent !== 'undefined' &&
                 typeof DeviceOrientationEvent.requestPermission === 'function') {
