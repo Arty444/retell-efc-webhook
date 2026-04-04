@@ -29,6 +29,29 @@ from visual_detector import detect_bird_in_frame
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_for_json(obj):
+    """Recursively convert numpy types to Python natives for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        sanitized = [_sanitize_for_json(v) for v in obj]
+        return tuple(sanitized) if isinstance(obj, tuple) else sanitized
+    elif isinstance(obj, (np.integer,)):
+        return int(obj)
+    elif isinstance(obj, (np.floating,)):
+        return float(obj)
+    elif isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
+async def _send_json(ws: WebSocket, data: dict):
+    """Send JSON via WebSocket, sanitizing numpy types first."""
+    await ws.send_json(_sanitize_for_json(data))
  
 app = FastAPI(title="Retell Voice Agent Webhook Server")
 
@@ -307,7 +330,7 @@ async def audio_websocket(websocket: WebSocket):
     distance_estimator = BirdDistanceEstimator()  # 6-method Kalman fusion
 
     try:
-        await websocket.send_json({"type": "status", "message": "Connected. Start listening to detect birds!"})
+        await _send_json(websocket,{"type": "status", "message": "Connected. Start listening to detect birds!"})
 
         while True:
             data = await websocket.receive_json()
@@ -318,7 +341,7 @@ async def audio_websocket(websocket: WebSocket):
                 config["longitude"] = float(data.get("longitude", 0))
                 config["enable_separation"] = bool(data.get("enable_separation", False))
                 mode = "multi-bird" if config["enable_separation"] else "single"
-                await websocket.send_json({
+                await _send_json(websocket,{
                     "type": "status",
                     "message": f"Location set ({config['latitude']:.1f}, {config['longitude']:.1f}) | Mode: {mode}"
                 })
@@ -332,7 +355,7 @@ async def audio_websocket(websocket: WebSocket):
                 if room_id:
                     room = device_rooms[room_id]
                     room.add_device(device_id, config["latitude"], config["longitude"])
-                    await websocket.send_json({
+                    await _send_json(websocket,{
                         "type": "room_joined",
                         "room_id": room_id,
                         "device_id": device_id,
@@ -387,7 +410,7 @@ async def audio_websocket(websocket: WebSocket):
                                 frame_w, frame_h,
                                 zoom=zoom,
                             )
-                            await websocket.send_json({
+                            await _send_json(websocket,{
                                 "type": "visual_detection",
                                 "bbox": detection_result["bbox"],
                                 "confidence": detection_result["confidence"],
@@ -453,7 +476,7 @@ async def audio_websocket(websocket: WebSocket):
                         )
                         distance_estimator._last_azimuth = dir_4mic.get("heading")
                         dist_info = distance_estimator.get_distance()
-                        await websocket.send_json({
+                        await _send_json(websocket,{
                             "type": "direction_4mic",
                             "direction": dir_4mic,
                             "mic_count": mic_count,
@@ -483,7 +506,7 @@ async def audio_websocket(websocket: WebSocket):
                                 # Update species for distance estimator
                                 distance_estimator.update_species(detections[0]["species"])
                                 dist_info = distance_estimator.get_distance()
-                                await websocket.send_json({
+                                await _send_json(websocket,{
                                     "type": "detection",
                                     "detections": detections,
                                     "direction": dir_4mic,
@@ -551,7 +574,7 @@ async def audio_websocket(websocket: WebSocket):
                         )
                         distance_estimator._last_azimuth = stereo_dir.get("heading")
                         dist_info = distance_estimator.get_distance()
-                        await websocket.send_json({
+                        await _send_json(websocket,{
                             "type": "stereo_direction",
                             "direction": stereo_dir,
                             "distance": dist_info,
@@ -579,7 +602,7 @@ async def audio_websocket(websocket: WebSocket):
                             if detections:
                                 distance_estimator.update_species(detections[0]["species"])
                                 dist_info = distance_estimator.get_distance()
-                                await websocket.send_json({
+                                await _send_json(websocket,{
                                     "type": "detection",
                                     "detections": detections,
                                     "direction": stereo_dir,
@@ -613,7 +636,7 @@ async def audio_websocket(websocket: WebSocket):
                     if room.can_localize():
                         tri_result = room.localize()
                         if tri_result:
-                            await websocket.send_json({
+                            await _send_json(websocket,{
                                 "type": "triangulation",
                                 "result": {
                                     "bearing": tri_result.bearing,
@@ -699,7 +722,7 @@ async def _handle_single_bird(websocket, merged_pcm, recent, sample_rate, config
                 )
             dist_info = dist_est.get_distance()
 
-        await websocket.send_json({
+        await _send_json(websocket,{
             "type": "detection",
             "detections": detections,
             "direction": direction,
@@ -774,7 +797,7 @@ async def _handle_multi_bird(websocket, merged_pcm, recent, sample_rate, config,
             dist_est.update_species(birds[0]["species"])
             dist_info = dist_est.get_distance()
 
-        await websocket.send_json({
+        await _send_json(websocket,{
             "type": "multi_detection",
             "birds": birds,
             "source_count": len(sources),
