@@ -306,7 +306,7 @@ public class FourMicCapturePlugin: CAPPlugin, CAPBridgedPlugin {
     private var micCycleTimer: Timer?
     private var currentSourceIndex = 0
 
-    private func startMicCycling(session: AVAudioSession, builtInMic: AVAudioInputPort) {
+    private func startMicCycling(session: AVAudioSession, builtInMic: AVAudioSessionPortDescription) {
         guard let sources = builtInMic.dataSources, sources.count > 2 else { return }
 
         DispatchQueue.main.async { [weak self] in
