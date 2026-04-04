@@ -1,0 +1,22 @@
+{
+    "name": "Bird Sound Locator",
+    "short_name": "BirdLocator",
+    "description": "Detect and locate birds by their sounds using AI",
+    "start_url": "/app",
+    "display": "standalone",
+    "orientation": "portrait",
+    "theme_color": "#1a1a2e",
+    "background_color": "#1a1a2e",
+    "icons": [
+        {
+            "src": "/static/icon-192.png",
+            "sizes": "192x192",
+            "type": "image/png"
+        },
+        {
+            "src": "/static/icon-512.png",
+            "sizes": "512x512",
+            "type": "image/png"
+        }
+    ]
+}

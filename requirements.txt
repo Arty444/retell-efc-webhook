@@ -3,3 +3,7 @@ uvicorn[standard]
 httpx
 supabase
 python-dotenv
+birdnetlib>=0.7
+numpy
+scipy
+soundfile

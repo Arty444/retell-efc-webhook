@@ -1,16 +1,29 @@
 import os
+import base64
 import logging
 from datetime import datetime
- 
+from pathlib import Path
+
+import numpy as np
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from supabase import create_client, Client
- 
+
+from bird_analyzer import analyze_audio
+from audio_direction import estimate_direction
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
  
 app = FastAPI(title="Retell Voice Agent Webhook Server")
+
+# Mount static files for Bird Sound Locator PWA
+STATIC_DIR = Path(__file__).parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
  
 app.add_middleware(
     CORSMiddleware,
@@ -209,3 +222,129 @@ async def crm_webhook(request: Request):
         return {"status": "error", "message": str(e)}
  
     return {"status": "ok", "event_type": event_type}
+
+
+# ─── Bird Sound Locator ────────────────────────────────────────────────────────
+
+
+@app.get("/app", response_class=HTMLResponse)
+async def bird_locator_app():
+    """Serve the Bird Sound Locator PWA."""
+    index_path = STATIC_DIR / "index.html"
+    return HTMLResponse(content=index_path.read_text(), status_code=200)
+
+
+@app.websocket("/ws/audio")
+async def audio_websocket(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time bird sound analysis.
+
+    Protocol:
+    - Client sends: {"type": "config", "latitude": float, "longitude": float}
+    - Client sends: {"type": "audio_chunk", "data": "<base64 Int16 PCM>", "sample_rate": int, "heading": float}
+    - Server sends: {"type": "detection", "detections": [...], "direction": {...}}
+    - Server sends: {"type": "status", "message": str}
+    """
+    await websocket.accept()
+    logger.info("Bird locator WebSocket connected")
+
+    # Per-connection state
+    config = {"latitude": 0.0, "longitude": 0.0}
+    audio_buffer = []  # List of {"pcm": np.ndarray, "heading": float, "timestamp": float}
+    ANALYSIS_WINDOW_SECONDS = 3.0
+    ANALYSIS_INTERVAL_CHUNKS = 4  # Analyze every N chunks received
+    chunk_count = 0
+
+    try:
+        await websocket.send_json({"type": "status", "message": "Connected. Start listening to detect birds!"})
+
+        while True:
+            data = await websocket.receive_json()
+
+            if data.get("type") == "config":
+                config["latitude"] = float(data.get("latitude", 0))
+                config["longitude"] = float(data.get("longitude", 0))
+                await websocket.send_json({
+                    "type": "status",
+                    "message": f"Location set ({config['latitude']:.1f}, {config['longitude']:.1f})"
+                })
+                continue
+
+            if data.get("type") == "audio_chunk":
+                # Decode base64 Int16 PCM to float32 numpy array
+                try:
+                    raw_bytes = base64.b64decode(data["data"])
+                    int16_data = np.frombuffer(raw_bytes, dtype=np.int16)
+                    float32_data = int16_data.astype(np.float32) / 32768.0
+                    sample_rate = int(data.get("sample_rate", 44100))
+                    heading = float(data.get("heading", 0))
+                except Exception as e:
+                    logger.warning("Failed to decode audio chunk: %s", e)
+                    continue
+
+                audio_buffer.append({
+                    "pcm": float32_data,
+                    "heading": heading,
+                    "timestamp": datetime.utcnow().timestamp(),
+                })
+
+                # Trim buffer to analysis window
+                now = datetime.utcnow().timestamp()
+                audio_buffer = [
+                    c for c in audio_buffer
+                    if now - c["timestamp"] < ANALYSIS_WINDOW_SECONDS * 2
+                ]
+
+                chunk_count += 1
+
+                # Run analysis periodically when we have enough audio
+                if chunk_count % ANALYSIS_INTERVAL_CHUNKS == 0 and len(audio_buffer) >= 2:
+                    # Merge recent audio for BirdNET analysis
+                    recent = [c for c in audio_buffer if now - c["timestamp"] < ANALYSIS_WINDOW_SECONDS]
+                    if not recent:
+                        continue
+
+                    merged_pcm = np.concatenate([c["pcm"] for c in recent])
+
+                    # Run BirdNET classification
+                    try:
+                        detections = analyze_audio(
+                            pcm_data=merged_pcm,
+                            sample_rate=sample_rate,
+                            latitude=config["latitude"],
+                            longitude=config["longitude"],
+                            min_confidence=0.25,
+                        )
+                    except Exception as e:
+                        logger.error("BirdNET analysis failed: %s", e)
+                        detections = []
+
+                    # Estimate direction from amplitude across headings
+                    direction = None
+                    try:
+                        direction_chunks = [
+                            {"pcm_data": c["pcm"], "heading": c["heading"]}
+                            for c in recent
+                        ]
+                        direction = estimate_direction(direction_chunks, sample_rate)
+                    except Exception as e:
+                        logger.warning("Direction estimation failed: %s", e)
+
+                    if detections:
+                        response = {
+                            "type": "detection",
+                            "detections": detections,
+                            "direction": direction,
+                        }
+                        await websocket.send_json(response)
+                        logger.info(
+                            "Detected: %s (%.0f%%) heading=%s",
+                            detections[0]["species"],
+                            detections[0]["confidence"] * 100,
+                            direction.get("heading") if direction else "unknown",
+                        )
+
+    except WebSocketDisconnect:
+        logger.info("Bird locator WebSocket disconnected")
+    except Exception as e:
+        logger.error("WebSocket error: %s", e)

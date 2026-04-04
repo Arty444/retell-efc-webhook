@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#1a1a2e">
+    <title>Bird Sound Locator</title>
+    <link rel="manifest" href="/static/manifest.json">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- Permission/Start Screen -->
+    <div id="start-screen" class="screen active">
+        <div class="start-content">
+            <div class="logo">
+                <svg viewBox="0 0 100 100" width="80" height="80">
+                    <circle cx="50" cy="50" r="45" fill="none" stroke="#4ecdc4" stroke-width="2"/>
+                    <path d="M30 55 Q35 30 55 35 Q70 38 65 50 Q75 48 70 58 Q65 65 55 60 L45 65 Q35 68 30 55Z" fill="#4ecdc4"/>
+                    <circle cx="48" cy="42" r="3" fill="#1a1a2e"/>
+                </svg>
+            </div>
+            <h1>Bird Sound Locator</h1>
+            <p>Detect and locate birds by their sounds. Point your phone toward bird calls and let AI identify the species.</p>
+            <button id="start-btn" class="btn-primary">Start Birding</button>
+            <div id="permission-status" class="status-text"></div>
+        </div>
+    </div>
+
+    <!-- Main App Screen -->
+    <div id="app-screen" class="screen">
+        <!-- Camera Feed -->
+        <video id="camera-feed" autoplay playsinline muted></video>
+
+        <!-- Overlay Canvas (directional arrow + UI) -->
+        <canvas id="overlay-canvas"></canvas>
+
+        <!-- Top Status Bar -->
+        <div id="status-bar">
+            <div id="connection-status" class="status-dot disconnected"></div>
+            <span id="status-text">Connecting...</span>
+            <span id="compass-heading">--°</span>
+        </div>
+
+        <!-- Detection Info Panel -->
+        <div id="detection-panel" class="hidden">
+            <div id="species-name">--</div>
+            <div id="species-confidence">--</div>
+            <div id="direction-info">--</div>
+        </div>
+
+        <!-- Scan Mode Indicator -->
+        <div id="scan-indicator" class="hidden">
+            <div class="scan-ring"></div>
+            <span>Slowly rotate to scan...</span>
+        </div>
+
+        <!-- Bottom Controls -->
+        <div id="controls">
+            <button id="scan-btn" class="btn-round" title="Toggle scan mode">
+                <svg viewBox="0 0 24 24" width="24" height="24">
+                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z" fill="currentColor"/>
+                </svg>
+            </button>
+            <button id="listen-btn" class="btn-round btn-large" title="Toggle listening">
+                <svg viewBox="0 0 24 24" width="32" height="32">
+                    <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5z" fill="currentColor"/>
+                    <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" fill="currentColor"/>
+                </svg>
+            </button>
+            <button id="history-btn" class="btn-round" title="Detection history">
+                <svg viewBox="0 0 24 24" width="24" height="24">
+                    <path d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z" fill="currentColor"/>
+                </svg>
+            </button>
+        </div>
+
+        <!-- History Panel -->
+        <div id="history-panel" class="hidden">
+            <div class="panel-header">
+                <h3>Recent Detections</h3>
+                <button id="close-history" class="btn-close">&times;</button>
+            </div>
+            <div id="history-list"></div>
+        </div>
+
+        <!-- Audio Visualizer -->
+        <div id="audio-visualizer">
+            <canvas id="freq-canvas"></canvas>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
