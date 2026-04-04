@@ -450,6 +450,10 @@ class DistanceKalmanFilter:
         if confidence <= 0.01 or uncertainty <= 0:
             return
 
+        # Guard against NaN/Inf measurements
+        if not np.isfinite(distance) or not np.isfinite(uncertainty) or not np.isfinite(confidence):
+            return
+
         # Measurement variance (lower confidence = higher variance)
         R = (uncertainty / confidence) ** 2
 

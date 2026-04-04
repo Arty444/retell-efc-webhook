@@ -174,7 +174,17 @@ def _gcc_phat_delay(sig1: np.ndarray, sig2: np.ndarray, sample_rate: int,
 
     # Strength: peak-to-mean ratio (higher = more confident TDOA)
     avg_val = float(np.mean(np.abs(gcc_valid)))
-    strength = min(1.0, max(0.0, (peak_val / (avg_val + 1e-10) - 1) / 5))
+    peak_to_mean = peak_val / (avg_val + 1e-10) - 1
+    strength = min(1.0, max(0.0, peak_to_mean / 5))
+
+    # Sharpness check: for a real signal, the peak should be well above
+    # its immediate neighbors. For noise, the GCC is relatively flat.
+    # Compute the ratio of peak to the 75th percentile of the GCC.
+    p75 = float(np.percentile(np.abs(gcc_valid), 75))
+    sharpness = peak_val / (p75 + 1e-10)
+    # Real signals typically have sharpness > 3; noise is ~1.5-2.5
+    if sharpness < 2.5:
+        strength *= 0.3  # Heavily penalize flat/noisy correlations
 
     return {"delay_seconds": delay_seconds, "strength": strength}
 
@@ -397,10 +407,18 @@ def estimate_direction_4mic(
 
     # Confidence from average TDOA strength and residual quality
     avg_strength = np.mean([m["strength"] for m in tdoa_measurements])
-    n_good = sum(1 for m in tdoa_measurements if m["strength"] > 0.1)
+    n_good = sum(1 for m in tdoa_measurements if m["strength"] > 0.2)
     pair_coverage = n_good / max(len(available_pairs), 1)
     residual_quality = max(0, 1.0 - residual * 1e6)  # lower residual = better
-    confidence = (avg_strength * 0.4 + pair_coverage * 0.3 + residual_quality * 0.3)
+
+    # Require at least some pairs with strong cross-correlation peaks
+    # Random noise can produce moderate GCC-PHAT peaks, so we require
+    # that a minimum fraction of pairs show genuine signal correlation
+    if n_good < 2:
+        # Fewer than 2 strong pairs — very low confidence
+        confidence = min(0.15, avg_strength * 0.3)
+    else:
+        confidence = (avg_strength * 0.4 + pair_coverage * 0.3 + residual_quality * 0.3)
     confidence = min(1.0, max(0.0, confidence))
 
     return {
