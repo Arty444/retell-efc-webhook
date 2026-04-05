@@ -1,0 +1,1076 @@
+/**
+ * Bird Sound Locator - Frontend Application
+ *
+ * Supports:
+ * - Single bird detection with directional arrow
+ * - Multi-bird mode: AI source separation tracking multiple birds simultaneously
+ * - Multi-device triangulation: TDOA-based positioning with 2+ phones
+ * - Stereo mic ITD direction estimation
+ */
+
+(function () {
+    'use strict';
+
+    // Bird colors for multi-bird tracking (up to 6 birds)
+    const BIRD_COLORS = [
+        '#4ecdc4', '#e74c3c', '#f39c12', '#9b59b6', '#3498db', '#2ecc71',
+    ];
+
+    // --- State ---
+    const state = {
+        isListening: false,
+        isScanMode: false,
+        isConnected: false,
+        enableSeparation: false,
+        currentHeading: 0,
+        targetHeading: null,
+        targetConfidence: 0,
+        detectedSpecies: null,
+        detections: [],
+        activeBirds: [],      // Multi-bird: currently tracked birds
+        triangulation: null,  // Multi-device TDOA result
+        roomId: null,
+        deviceId: null,
+        latitude: 0,
+        longitude: 0,
+        audioContext: null,
+        mediaStream: null,
+        wsConnection: null,
+        audioChunkBuffer: [],
+        stereoChunkBuffer: [],  // stereo chunks for ITD direction
+        hasStereo: false,       // whether phone supports stereo mic
+        devicePitch: 90,        // device orientation
+        deviceRoll: 0,
+        lastSendTime: 0,
+    };
+
+    // --- Config ---
+    const CHUNK_INTERVAL_MS = 500;
+    const SEND_BUFFER_SECONDS = 3;
+    const WS_RECONNECT_DELAY = 2000;
+    const DETECTION_FADE_MS = 8000;
+
+    // --- DOM Elements ---
+    const $ = (sel) => document.querySelector(sel);
+    const startScreen = $('#start-screen');
+    const appScreen = $('#app-screen');
+    const startBtn = $('#start-btn');
+    const startMultiBtn = $('#start-multi-btn');
+    const permissionStatus = $('#permission-status');
+    const cameraFeed = $('#camera-feed');
+    const overlayCanvas = $('#overlay-canvas');
+    const ctx = overlayCanvas.getContext('2d');
+    const statusDot = $('#connection-status');
+    const statusText = $('#status-text');
+    const compassHeading = $('#compass-heading');
+    const detectionPanel = $('#detection-panel');
+    const speciesName = $('#species-name');
+    const speciesConfidence = $('#species-confidence');
+    const directionInfo = $('#direction-info');
+    const multiDetectionPanel = $('#multi-detection-panel');
+    const birdList = $('#bird-list');
+    const sourceCount = $('#source-count');
+    const triangulationPanel = $('#triangulation-panel');
+    const triBearing = $('#tri-bearing');
+    const triDistance = $('#tri-distance');
+    const triDevices = $('#tri-devices');
+    const scanIndicator = $('#scan-indicator');
+    const scanBtn = $('#scan-btn');
+    const listenBtn = $('#listen-btn');
+    const historyBtn = $('#history-btn');
+    const historyPanel = $('#history-panel');
+    const closeHistory = $('#close-history');
+    const historyList = $('#history-list');
+    const freqCanvas = $('#freq-canvas');
+    const freqCtx = freqCanvas.getContext('2d');
+    const roomSection = $('#room-section');
+    const createRoomBtn = $('#create-room-btn');
+    const joinRoomBtn = $('#join-room-btn');
+    const roomIdInput = $('#room-id-input');
+    const roomStatus = $('#room-status');
+
+    // --- Initialization ---
+    startBtn.addEventListener('click', () => startApp(false));
+    startMultiBtn.addEventListener('click', () => {
+        state.enableSeparation = true;
+        roomSection.classList.remove('hidden');
+    });
+    createRoomBtn.addEventListener('click', createRoom);
+    joinRoomBtn.addEventListener('click', () => {
+        const code = roomIdInput.value.trim();
+        if (code) {
+            state.roomId = code;
+            roomStatus.textContent = 'Room code: ' + code + ' (will join on start)';
+        }
+    });
+    listenBtn.addEventListener('click', toggleListening);
+    scanBtn.addEventListener('click', toggleScanMode);
+    historyBtn.addEventListener('click', () => historyPanel.classList.toggle('hidden'));
+    closeHistory.addEventListener('click', () => historyPanel.classList.add('hidden'));
+
+    resizeCanvases();
+    window.addEventListener('resize', resizeCanvases);
+
+    function resizeCanvases() {
+        overlayCanvas.width = window.innerWidth * devicePixelRatio;
+        overlayCanvas.height = window.innerHeight * devicePixelRatio;
+        overlayCanvas.style.width = window.innerWidth + 'px';
+        overlayCanvas.style.height = window.innerHeight + 'px';
+        ctx.scale(devicePixelRatio, devicePixelRatio);
+
+        freqCanvas.width = freqCanvas.parentElement.offsetWidth * devicePixelRatio;
+        freqCanvas.height = freqCanvas.parentElement.offsetHeight * devicePixelRatio;
+    }
+
+    async function createRoom() {
+        try {
+            const resp = await fetch('/api/room/create', { method: 'POST' });
+            const data = await resp.json();
+            state.roomId = data.room_id;
+            roomIdInput.value = data.room_id;
+            roomStatus.textContent = 'Room created: ' + data.room_id + ' - Share this code!';
+        } catch (err) {
+            roomStatus.textContent = 'Failed to create room: ' + err.message;
+        }
+    }
+
+    function startApp(skipSeparation) {
+        if (skipSeparation) state.enableSeparation = false;
+        requestPermissionsAndStart();
+    }
+
+    // --- Permissions & Startup ---
+    async function requestPermissionsAndStart() {
+        startBtn.disabled = true;
+        startMultiBtn.disabled = true;
+        permissionStatus.textContent = 'Requesting permissions...';
+
+        try {
+            // Check if native Capacitor mic bridge will handle audio
+            var isNative = typeof window.Capacitor !== 'undefined' && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform();
+
+            if (!isNative && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                permissionStatus.textContent = 'Requesting microphone access...';
+                // Request maximum mic channels (iPhone 16 PM has 4 mics)
+                // Web Audio API may expose 2+ channels depending on browser/OS
+                var micChannels = 1;
+                for (var tryChannels = 4; tryChannels >= 2; tryChannels--) {
+                    try {
+                        state.mediaStream = await navigator.mediaDevices.getUserMedia({
+                            audio: {
+                                echoCancellation: false,
+                                noiseSuppression: false,
+                                autoGainControl: false,
+                                sampleRate: 44100,
+                                channelCount: { ideal: tryChannels, min: 1 },
+                            },
+                        });
+                        var audioTrack = state.mediaStream.getAudioTracks()[0];
+                        var settings = audioTrack.getSettings();
+                        micChannels = settings.channelCount || 1;
+                        break;
+                    } catch (e) {
+                        if (tryChannels === 2) {
+                            // Final fallback to mono
+                            state.mediaStream = await navigator.mediaDevices.getUserMedia({
+                                audio: {
+                                    echoCancellation: false,
+                                    noiseSuppression: false,
+                                    autoGainControl: false,
+                                    sampleRate: 44100,
+                                },
+                            });
+                            micChannels = 1;
+                        }
+                    }
+                }
+                state.micCount = micChannels;
+                state.hasStereo = micChannels >= 2;
+                var micMsg = micChannels >= 4 ? '4 mics detected! Full 3D localization.'
+                           : micChannels >= 2 ? micChannels + ' mics detected. Stereo direction.'
+                           : 'Mono mic. Use scan mode for direction.';
+                permissionStatus.textContent = micMsg;
+            } else if (isNative) {
+                permissionStatus.textContent = 'Native mic capture — waiting for bridge...';
+                state.micCount = 4;  // Native bridge will detect actual count
+                state.hasStereo = true;
+            } else {
+                permissionStatus.textContent = 'Microphone API not available';
+                state.micCount = 1;
+                state.hasStereo = false;
+            }
+
+            // Request camera (skip if mediaDevices not available)
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                try {
+                    permissionStatus.textContent = 'Requesting camera access...';
+                    const videoStream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
+                    });
+                    cameraFeed.srcObject = videoStream;
+                } catch (camErr) {
+                    console.warn('Camera not available:', camErr);
+                }
+            }
+
+            if (typeof DeviceOrientationEvent !== 'undefined' &&
+                typeof DeviceOrientationEvent.requestPermission === 'function') {
+                permissionStatus.textContent = 'Requesting compass access...';
+                const response = await DeviceOrientationEvent.requestPermission();
+                if (response !== 'granted') {
+                    throw new Error('Device orientation permission denied');
+                }
+            }
+
+            permissionStatus.textContent = 'Getting location...';
+            try {
+                const pos = await new Promise((resolve, reject) =>
+                    navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 5000 })
+                );
+                state.latitude = pos.coords.latitude;
+                state.longitude = pos.coords.longitude;
+            } catch {
+                console.warn('Geolocation unavailable');
+            }
+
+            startScreen.classList.remove('active');
+            appScreen.classList.add('active');
+
+            initAudio();
+            initCompass();
+            initCameraCapture();
+            connectWebSocket();
+            requestAnimationFrame(renderLoop);
+            registerServiceWorker();
+
+        } catch (err) {
+            permissionStatus.textContent = 'Error: ' + err.message;
+            startBtn.disabled = false;
+            startMultiBtn.disabled = false;
+        }
+    }
+
+    // --- Audio Capture ---
+    function initAudio() {
+        state.audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: 44100,
+        });
+
+        const source = state.audioContext.createMediaStreamSource(state.mediaStream);
+
+        state.analyser = state.audioContext.createAnalyser();
+        state.analyser.fftSize = 256;
+        source.connect(state.analyser);
+
+        // Request as many input channels as the phone provides
+        var inputChannels = state.micCount || 1;
+        var bufferSize = 4096;
+        var processor = state.audioContext.createScriptProcessor(bufferSize, inputChannels, 1);
+
+        processor.onaudioprocess = function(e) {
+            if (!state.isListening) return;
+
+            var nCh = e.inputBuffer.numberOfChannels;
+            var ch0 = new Float32Array(e.inputBuffer.getChannelData(0));
+
+            if (nCh >= 2) {
+                // Capture all available channels
+                var allChannels = [];
+                for (var c = 0; c < nCh; c++) {
+                    allChannels.push(new Float32Array(e.inputBuffer.getChannelData(c)));
+                }
+                state.stereoChunkBuffer.push({
+                    channels: allChannels,
+                    heading: state.currentHeading,
+                    pitch: state.devicePitch,
+                    roll: state.deviceRoll,
+                    timestamp: Date.now(),
+                });
+            }
+
+            // Always buffer ch0 for mono fallback/classification
+            state.audioChunkBuffer.push({
+                pcm: ch0,
+                heading: state.currentHeading,
+                timestamp: Date.now(),
+            });
+
+            var now = Date.now();
+            if (now - state.lastSendTime >= CHUNK_INTERVAL_MS) {
+                if (nCh >= 4) {
+                    send4MicChunk();
+                } else if (nCh >= 2) {
+                    sendStereoChunk();
+                } else {
+                    sendAudioChunk();
+                }
+                state.lastSendTime = now;
+            }
+        };
+
+        source.connect(processor);
+        processor.connect(state.audioContext.destination);
+    }
+
+    function sendAudioChunk() {
+        if (!state.wsConnection || state.wsConnection.readyState !== WebSocket.OPEN) return;
+        if (state.audioChunkBuffer.length === 0) return;
+
+        const totalSamples = state.audioChunkBuffer.reduce((sum, c) => sum + c.pcm.length, 0);
+        const merged = new Float32Array(totalSamples);
+        let offset = 0;
+        for (const chunk of state.audioChunkBuffer) {
+            merged.set(chunk.pcm, offset);
+            offset += chunk.pcm.length;
+        }
+
+        const avgHeading = averageHeading(state.audioChunkBuffer.map((c) => c.heading));
+        const int16 = float32ToInt16(merged);
+        const base64Data = arrayBufferToBase64(int16.buffer);
+
+        state.wsConnection.send(JSON.stringify({
+            type: 'audio_chunk',
+            data: base64Data,
+            sample_rate: state.audioContext.sampleRate,
+            heading: Math.round(avgHeading * 10) / 10,
+        }));
+
+        const cutoff = Date.now() - SEND_BUFFER_SECONDS * 1000;
+        state.audioChunkBuffer = state.audioChunkBuffer.filter((c) => c.timestamp > cutoff);
+    }
+
+    function sendStereoChunk() {
+        if (!state.wsConnection || state.wsConnection.readyState !== WebSocket.OPEN) return;
+        if (state.stereoChunkBuffer.length === 0) return;
+
+        // Merge stereo chunks
+        var totalSamples = state.stereoChunkBuffer.reduce(function(sum, c) { return sum + c.ch1.length; }, 0);
+        var mergedCh1 = new Float32Array(totalSamples);
+        var mergedCh2 = new Float32Array(totalSamples);
+        var off = 0;
+        for (var i = 0; i < state.stereoChunkBuffer.length; i++) {
+            var chunk = state.stereoChunkBuffer[i];
+            mergedCh1.set(chunk.ch1, off);
+            mergedCh2.set(chunk.ch2, off);
+            off += chunk.ch1.length;
+        }
+
+        var avgH = averageHeading(state.stereoChunkBuffer.map(function(c) { return c.heading; }));
+        var lastChunk = state.stereoChunkBuffer[state.stereoChunkBuffer.length - 1];
+
+        var int16Ch1 = float32ToInt16(mergedCh1);
+        var int16Ch2 = float32ToInt16(mergedCh2);
+
+        state.wsConnection.send(JSON.stringify({
+            type: 'audio_stereo',
+            ch1: arrayBufferToBase64(int16Ch1.buffer),
+            ch2: arrayBufferToBase64(int16Ch2.buffer),
+            sample_rate: state.audioContext.sampleRate,
+            heading: Math.round(avgH * 10) / 10,
+            pitch: Math.round(lastChunk.pitch * 10) / 10,
+            roll: Math.round(lastChunk.roll * 10) / 10,
+        }));
+
+        var cutoff = Date.now() - SEND_BUFFER_SECONDS * 1000;
+        state.stereoChunkBuffer = state.stereoChunkBuffer.filter(function(c) { return c.timestamp > cutoff; });
+        state.audioChunkBuffer = state.audioChunkBuffer.filter(function(c) { return c.timestamp > cutoff; });
+    }
+
+    function send4MicChunk() {
+        if (!state.wsConnection || state.wsConnection.readyState !== WebSocket.OPEN) return;
+        if (state.stereoChunkBuffer.length === 0) return;
+
+        // Merge all 4 channels across buffered chunks
+        var nCh = state.stereoChunkBuffer[0].channels.length;
+        var totalSamples = state.stereoChunkBuffer.reduce(function(s, c) { return s + c.channels[0].length; }, 0);
+        var merged = [];
+        for (var c = 0; c < nCh; c++) { merged.push(new Float32Array(totalSamples)); }
+        var off = 0;
+        for (var i = 0; i < state.stereoChunkBuffer.length; i++) {
+            var chunk = state.stereoChunkBuffer[i];
+            for (var c = 0; c < nCh; c++) {
+                merged[c].set(chunk.channels[c], off);
+            }
+            off += chunk.channels[0].length;
+        }
+
+        var avgH = averageHeading(state.stereoChunkBuffer.map(function(c) { return c.heading; }));
+        var last = state.stereoChunkBuffer[state.stereoChunkBuffer.length - 1];
+
+        // Encode each channel as base64 Int16
+        var encodedChannels = merged.map(function(ch) {
+            return arrayBufferToBase64(float32ToInt16(ch).buffer);
+        });
+
+        state.wsConnection.send(JSON.stringify({
+            type: 'audio_4mic',
+            channels: encodedChannels,
+            sample_rate: state.audioContext.sampleRate,
+            heading: Math.round(avgH * 10) / 10,
+            pitch: Math.round(last.pitch * 10) / 10,
+            roll: Math.round(last.roll * 10) / 10,
+        }));
+
+        var cutoff = Date.now() - SEND_BUFFER_SECONDS * 1000;
+        state.stereoChunkBuffer = state.stereoChunkBuffer.filter(function(c) { return c.timestamp > cutoff; });
+        state.audioChunkBuffer = state.audioChunkBuffer.filter(function(c) { return c.timestamp > cutoff; });
+    }
+
+    function float32ToInt16(float32) {
+        const int16 = new Int16Array(float32.length);
+        for (let i = 0; i < float32.length; i++) {
+            const s = Math.max(-1, Math.min(1, float32[i]));
+            int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        return int16;
+    }
+
+    function arrayBufferToBase64(buffer) {
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        for (let i = 0; i < bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return btoa(binary);
+    }
+
+    function averageHeading(headings) {
+        if (headings.length === 0) return 0;
+        let sinSum = 0, cosSum = 0;
+        for (const h of headings) {
+            const rad = (h * Math.PI) / 180;
+            sinSum += Math.sin(rad);
+            cosSum += Math.cos(rad);
+        }
+        let avg = (Math.atan2(sinSum, cosSum) * 180) / Math.PI;
+        return (avg + 360) % 360;
+    }
+
+    // --- Camera Frame Capture (for visual rangefinding) ---
+    function initCameraCapture() {
+        // Capture frames from the camera video feed and send to backend
+        // for bird detection + size-based distance estimation.
+        // Uses an offscreen canvas to grab pixel data.
+        var captureCanvas = document.createElement('canvas');
+        var captureCtx = captureCanvas.getContext('2d', { willReadFrequently: true });
+        var CAPTURE_INTERVAL_MS = 1000; // 1 frame per second (low bandwidth)
+        var CAPTURE_WIDTH = 320;        // Downscale for network efficiency
+        var CAPTURE_HEIGHT = 240;
+        captureCanvas.width = CAPTURE_WIDTH;
+        captureCanvas.height = CAPTURE_HEIGHT;
+
+        setInterval(function() {
+            if (!state.isListening || !state.wsConnection ||
+                state.wsConnection.readyState !== WebSocket.OPEN) return;
+
+            // Only send frames when we have a detected bird (saves bandwidth)
+            if (!state.detectedSpecies && state.activeBirds.length === 0) return;
+
+            if (!cameraFeed.videoWidth || !cameraFeed.videoHeight) return;
+
+            try {
+                captureCtx.drawImage(cameraFeed, 0, 0, CAPTURE_WIDTH, CAPTURE_HEIGHT);
+                var imageData = captureCtx.getImageData(0, 0, CAPTURE_WIDTH, CAPTURE_HEIGHT);
+
+                // Send raw RGBA pixels as base64
+                var uint8 = new Uint8Array(imageData.data.buffer);
+                var binary = '';
+                for (var i = 0; i < uint8.length; i++) {
+                    binary += String.fromCharCode(uint8[i]);
+                }
+                var b64 = btoa(binary);
+
+                state.wsConnection.send(JSON.stringify({
+                    type: 'camera_frame',
+                    data: b64,
+                    width: CAPTURE_WIDTH,
+                    height: CAPTURE_HEIGHT,
+                    heading: state.currentHeading,
+                    zoom: 1.0,
+                }));
+            } catch (e) {
+                // Camera frame capture can fail due to CORS or security restrictions
+            }
+        }, CAPTURE_INTERVAL_MS);
+    }
+
+    // --- Compass & IMU ---
+    function initCompass() {
+        window.addEventListener('deviceorientation', (e) => {
+            let heading;
+            if (e.webkitCompassHeading !== undefined) {
+                heading = e.webkitCompassHeading;
+            } else if (e.alpha !== null) {
+                heading = (360 - e.alpha) % 360;
+            } else {
+                return;
+            }
+            state.currentHeading = heading;
+            if (e.beta !== null) state.devicePitch = e.beta;
+            if (e.gamma !== null) state.deviceRoll = e.gamma;
+            compassHeading.textContent = Math.round(heading) + '\u00B0';
+        });
+
+        // IMU: accelerometer + gyroscope for acoustic SLAM dead reckoning
+        if (window.DeviceMotionEvent) {
+            var lastImuSend = 0;
+            var IMU_SEND_INTERVAL = 100; // 10 Hz
+            window.addEventListener('devicemotion', function(e) {
+                if (!state.isListening || !state.wsConnection ||
+                    state.wsConnection.readyState !== WebSocket.OPEN) return;
+
+                var now = Date.now();
+                if (now - lastImuSend < IMU_SEND_INTERVAL) return;
+                lastImuSend = now;
+
+                var accel = e.accelerationIncludingGravity || {};
+                var gyro = e.rotationRate || {};
+                state.wsConnection.send(JSON.stringify({
+                    type: 'imu_data',
+                    timestamp: now / 1000,
+                    accel_x: accel.x || 0,
+                    accel_y: accel.y || 0,
+                    accel_z: accel.z || 0,
+                    gyro_x: (gyro.alpha || 0) * Math.PI / 180,
+                    gyro_y: (gyro.beta || 0) * Math.PI / 180,
+                    gyro_z: (gyro.gamma || 0) * Math.PI / 180,
+                    heading: state.currentHeading,
+                    pitch: state.devicePitch,
+                    roll: state.deviceRoll,
+                }));
+            });
+        }
+
+        setTimeout(() => {
+            if (state.currentHeading === 0) compassHeading.textContent = 'No compass';
+        }, 2000);
+    }
+
+    // --- WebSocket ---
+    function connectWebSocket() {
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = protocol + '//' + location.host + '/ws/audio';
+
+        setConnectionStatus('connecting');
+        const ws = new WebSocket(wsUrl);
+        state.wsConnection = ws;
+
+        ws.onopen = () => {
+            setConnectionStatus('connected');
+            ws.send(JSON.stringify({
+                type: 'config',
+                latitude: state.latitude,
+                longitude: state.longitude,
+                enable_separation: state.enableSeparation,
+            }));
+
+            // Update mic mode indicator
+            var micMode = document.getElementById('mic-mode');
+            if (state.micCount >= 4) {
+                micMode.textContent = '4-MIC 3D';
+                micMode.className = 'mic-badge';
+            } else if (state.micCount >= 2) {
+                micMode.textContent = state.micCount + '-MIC';
+                micMode.className = 'mic-badge';
+            } else {
+                micMode.textContent = 'MONO';
+                micMode.className = 'mic-badge mono';
+            }
+
+            // Join room if one was configured
+            if (state.roomId) {
+                state.deviceId = 'dev-' + Math.random().toString(36).substr(2, 6);
+                ws.send(JSON.stringify({
+                    type: 'join_room',
+                    room_id: state.roomId,
+                    device_id: state.deviceId,
+                }));
+            }
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                handleServerMessage(JSON.parse(event.data));
+            } catch (err) {
+                console.error('Parse error:', err);
+            }
+        };
+
+        ws.onclose = () => {
+            setConnectionStatus('disconnected');
+            setTimeout(connectWebSocket, WS_RECONNECT_DELAY);
+        };
+
+        ws.onerror = () => {
+            setConnectionStatus('disconnected');
+            ws.close();
+        };
+    }
+
+    function setConnectionStatus(status) {
+        statusDot.className = 'status-dot ' + status;
+        state.isConnected = status === 'connected';
+        if (status === 'connected') statusText.textContent = 'Connected';
+        else if (status === 'connecting') statusText.textContent = 'Connecting...';
+        else statusText.textContent = 'Disconnected';
+    }
+
+    function handleServerMessage(msg) {
+        // Single bird detection
+        if (msg.type === 'detection' && msg.detections && msg.detections.length > 0) {
+            handleSingleDetection(msg);
+        }
+
+        // Multi-bird detection (source separation)
+        if (msg.type === 'multi_detection' && msg.birds) {
+            handleMultiDetection(msg);
+        }
+
+        // Multi-device triangulation result
+        if (msg.type === 'triangulation' && msg.result) {
+            handleTriangulation(msg);
+        }
+
+        // 4-mic 3D direction (iPhone 16 Pro Max)
+        if (msg.type === 'direction_4mic' && msg.direction) {
+            state.targetHeading = msg.direction.heading;
+            state.targetConfidence = msg.direction.confidence;
+            state.targetElevation = msg.direction.elevation || 0;
+            state.micChannel = '4mic-3d';
+            state.lastDetectionTime = Date.now();
+            if (msg.distance) state.distanceInfo = msg.distance;
+
+            if (!detectionPanel.classList.contains('hidden')) {
+                var dir = getCardinalDirection(msg.direction.heading);
+                var elevStr = Math.round(msg.direction.elevation) !== 0
+                    ? ' | Elev: ' + Math.round(msg.direction.elevation) + '\u00B0' : '';
+                var distStr = msg.distance && msg.distance.distance
+                    ? ' | ~' + msg.distance.distance + 'm' : '';
+                directionInfo.textContent = 'Direction: ' + dir +
+                    ' (' + Math.round(msg.direction.heading) + '\u00B0)' + elevStr +
+                    distStr +
+                    ' [' + (msg.mic_count || '?') + ' mics, ' +
+                    (msg.direction.n_pairs_used || '?') + ' pairs]';
+            }
+        }
+
+        // Stereo direction (primary ITD-based direction from phone mics)
+        if (msg.type === 'stereo_direction' && msg.direction) {
+            state.targetHeading = msg.direction.heading;
+            state.targetConfidence = msg.direction.confidence;
+            state.targetElevation = msg.direction.elevation || 0;
+            state.micChannel = msg.direction.mic_channel || 'unknown';
+            state.lastDetectionTime = Date.now();
+            if (msg.distance) state.distanceInfo = msg.distance;
+
+            if (!detectionPanel.classList.contains('hidden')) {
+                var dir = getCardinalDirection(msg.direction.heading);
+                var elevStr = msg.direction.elevation !== 0
+                    ? ' | Elev: ' + Math.round(msg.direction.elevation) + '\u00B0' : '';
+                var distStr = msg.distance && msg.distance.distance
+                    ? ' | ~' + msg.distance.distance + 'm' : '';
+                directionInfo.textContent = 'Direction: ' + dir +
+                    ' (' + Math.round(msg.direction.heading) + '\u00B0)' + elevStr +
+                    distStr +
+                    ' | ITD: ' + msg.direction.itd_us + '\u00B5s';
+            }
+        }
+
+        // Visual detection (camera-based bird detection)
+        if (msg.type === 'visual_detection') {
+            if (msg.distance) state.distanceInfo = msg.distance;
+        }
+
+        // Room joined
+        if (msg.type === 'room_joined') {
+            statusText.textContent = 'Room ' + msg.room_id + ' (' + msg.device_count + ' devices)';
+        }
+
+        if (msg.type === 'status') {
+            statusText.textContent = msg.message || 'Listening...';
+        }
+    }
+
+    function handleSingleDetection(msg) {
+        const top = msg.detections[0];
+        state.detectedSpecies = top.species;
+        state.targetConfidence = top.confidence;
+        state.lastDetectionTime = Date.now();
+        state.distanceInfo = msg.distance || null;
+
+        if (msg.direction && msg.direction.heading !== undefined) {
+            state.targetHeading = msg.direction.heading;
+        }
+
+        speciesName.textContent = top.species;
+        var confText = Math.round(top.confidence * 100) + '% confidence';
+        if (msg.distance && msg.distance.distance) {
+            confText += ' | ~' + msg.distance.distance + 'm away';
+            if (msg.distance.confidence > 0) {
+                confText += ' (\u00B1' + (msg.distance.uncertainty || '?') + 'm)';
+            }
+        }
+        speciesConfidence.textContent = confText;
+
+        if (state.targetHeading !== null) {
+            const dir = getCardinalDirection(state.targetHeading);
+            var dirText = 'Direction: ' + dir + ' (' + Math.round(state.targetHeading) + '\u00B0)';
+            if (msg.distance && msg.distance.methods_used && msg.distance.methods_used.length > 0) {
+                dirText += ' | Methods: ' + msg.distance.methods_used.join(', ');
+            }
+            directionInfo.textContent = dirText;
+        } else {
+            directionInfo.textContent = 'Direction: Scanning...';
+        }
+
+        detectionPanel.classList.remove('hidden');
+        multiDetectionPanel.classList.add('hidden');
+
+        state.detections.unshift({
+            species: top.species,
+            confidence: top.confidence,
+            heading: state.targetHeading,
+            distance: msg.distance ? msg.distance.distance : null,
+            time: new Date(),
+        });
+        if (state.detections.length > 50) state.detections.pop();
+        updateHistoryList();
+
+        if (msg.detections.length > 1) {
+            const others = msg.detections.slice(1, 3).map(
+                (d) => d.species + ' (' + Math.round(d.confidence * 100) + '%)'
+            ).join(', ');
+            directionInfo.textContent += ' | Also: ' + others;
+        }
+    }
+
+    function handleMultiDetection(msg) {
+        state.activeBirds = msg.birds;
+        state.lastDetectionTime = Date.now();
+        state.distanceInfo = msg.distance || null;
+
+        detectionPanel.classList.add('hidden');
+        multiDetectionPanel.classList.remove('hidden');
+
+        var countText = (msg.source_count || msg.birds.length);
+        if (msg.distance && msg.distance.distance) {
+            countText += ' | ~' + msg.distance.distance + 'm';
+        }
+        sourceCount.textContent = countText;
+
+        birdList.innerHTML = msg.birds.map((bird, idx) => {
+            const color = BIRD_COLORS[idx % BIRD_COLORS.length];
+            const headingStr = bird.heading !== undefined
+                ? getCardinalDirection(bird.heading) + ' ' + Math.round(bird.heading) + '\u00B0'
+                : 'scanning...';
+            const freqStr = bird.freq_range
+                ? (bird.freq_range[0] / 1000).toFixed(1) + '-' + (bird.freq_range[1] / 1000).toFixed(1) + ' kHz'
+                : '';
+
+            return '<div class="bird-item">' +
+                '<div class="bird-color-dot" style="background:' + color + '"></div>' +
+                '<div class="bird-info">' +
+                '<div class="bird-species" style="color:' + color + '">' + escapeHtml(bird.species) + '</div>' +
+                '<div class="bird-meta">' + Math.round(bird.confidence * 100) + '% | ' + freqStr + '</div>' +
+                '</div>' +
+                '<div class="bird-direction">' + headingStr + '</div>' +
+                '</div>';
+        }).join('');
+
+        // Add all to history
+        for (const bird of msg.birds) {
+            state.detections.unshift({
+                species: bird.species,
+                confidence: bird.confidence,
+                heading: bird.heading || null,
+                time: new Date(),
+            });
+        }
+        if (state.detections.length > 50) state.detections.length = 50;
+        updateHistoryList();
+    }
+
+    function handleTriangulation(msg) {
+        state.triangulation = msg.result;
+        state.lastDetectionTime = Date.now();
+        triangulationPanel.classList.remove('hidden');
+
+        const r = msg.result;
+        const dir = getCardinalDirection(r.bearing);
+        triBearing.textContent = dir + ' ' + Math.round(r.bearing) + '\u00B0';
+        triDistance.textContent = r.distance > 0 ? 'Distance: ~' + r.distance + 'm' : 'Distance: estimating...';
+
+        const deviceCount = msg.devices ? msg.devices.length : '?';
+        triDevices.textContent = deviceCount + ' devices | Confidence: ' + Math.round(r.confidence * 100) + '%';
+
+        // Use triangulation bearing as the target heading
+        state.targetHeading = r.bearing;
+        state.targetConfidence = r.confidence;
+    }
+
+    function getCardinalDirection(heading) {
+        const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+        return dirs[Math.round(heading / 45) % 8];
+    }
+
+    // --- UI ---
+    function toggleListening() {
+        state.isListening = !state.isListening;
+        listenBtn.classList.toggle('active', state.isListening);
+
+        if (state.isListening) {
+            var micMode = state.hasStereo ? 'stereo ITD' : 'mono';
+            var birdMode = state.enableSeparation ? 'multi-bird' : 'single';
+            statusText.textContent = 'Listening (' + birdMode + ', ' + micMode + ')...';
+            if (state.audioContext && state.audioContext.state === 'suspended') {
+                state.audioContext.resume();
+            }
+        } else {
+            statusText.textContent = 'Paused';
+            state.audioChunkBuffer = [];
+            detectionPanel.classList.add('hidden');
+            multiDetectionPanel.classList.add('hidden');
+            triangulationPanel.classList.add('hidden');
+        }
+    }
+
+    function toggleScanMode() {
+        state.isScanMode = !state.isScanMode;
+        scanBtn.classList.toggle('active', state.isScanMode);
+        scanIndicator.classList.toggle('hidden', !state.isScanMode);
+        if (state.isScanMode && !state.isListening) toggleListening();
+    }
+
+    function updateHistoryList() {
+        if (state.detections.length === 0) {
+            historyList.innerHTML = '<div class="empty-history">No detections yet. Start listening to identify birds!</div>';
+            return;
+        }
+        historyList.innerHTML = state.detections.map((d) => {
+            const timeStr = d.time.toLocaleTimeString();
+            const headingStr = d.heading !== null ? ' | ' + Math.round(d.heading) + '\u00B0' : '';
+            const distStr = d.distance ? ' | ~' + d.distance + 'm' : '';
+            return '<div class="history-item">' +
+                '<div><div class="species">' + escapeHtml(d.species) + '</div>' +
+                '<div class="meta">' + timeStr + headingStr + distStr + '</div></div>' +
+                '<div class="confidence-badge">' + Math.round(d.confidence * 100) + '%</div></div>';
+        }).join('');
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    // --- Rendering ---
+    function renderLoop() {
+        drawOverlay();
+        drawFrequencyVisualizer();
+        requestAnimationFrame(renderLoop);
+    }
+
+    function drawOverlay() {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        ctx.clearRect(0, 0, w, h);
+
+        if (state.lastDetectionTime && Date.now() - state.lastDetectionTime > DETECTION_FADE_MS) {
+            state.targetHeading = null;
+            state.detectedSpecies = null;
+            state.activeBirds = [];
+            detectionPanel.classList.add('hidden');
+            multiDetectionPanel.classList.add('hidden');
+            triangulationPanel.classList.add('hidden');
+        }
+
+        if (!state.isListening) return;
+
+        const cx = w / 2;
+        const cy = h / 2;
+
+        // Draw center reticle always when listening
+        drawReticle(cx, cy);
+
+        // Multi-bird mode: draw individual arrows for each bird
+        if (state.activeBirds.length > 0) {
+            state.activeBirds.forEach((bird, idx) => {
+                if (bird.heading === undefined) return;
+                const color = BIRD_COLORS[idx % BIRD_COLORS.length];
+                drawBirdArrow(cx, cy, bird.heading, bird.confidence || 0.5, color, bird.species, w, h);
+            });
+        }
+        // Single bird / triangulation arrow
+        else if (state.targetHeading !== null) {
+            drawBirdArrow(cx, cy, state.targetHeading, state.targetConfidence, '#4ecdc4', state.detectedSpecies, w, h);
+        }
+
+        // Draw distance info overlay
+        if (state.distanceInfo && state.distanceInfo.distance && state.isListening) {
+            drawDistanceOverlay(w, h);
+        }
+
+        // Scan ring
+        if (state.isScanMode && state.scanAmplitudes) {
+            drawScanRing(cx, cy, Math.min(w, h) * 0.42);
+        }
+    }
+
+    function drawReticle(cx, cy) {
+        const size = 30;
+        ctx.strokeStyle = 'rgba(78, 205, 196, 0.4)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(cx, cy, size, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(cx - size - 5, cy); ctx.lineTo(cx - size + 10, cy);
+        ctx.moveTo(cx + size + 5, cy); ctx.lineTo(cx + size - 10, cy);
+        ctx.moveTo(cx, cy - size - 5); ctx.lineTo(cx, cy - size + 10);
+        ctx.moveTo(cx, cy + size + 5); ctx.lineTo(cx, cy + size - 10);
+        ctx.stroke();
+    }
+
+    function drawBirdArrow(cx, cy, targetHeading, confidence, color, label, w, h) {
+        let relativeAngle = targetHeading - state.currentHeading;
+        while (relativeAngle > 180) relativeAngle -= 360;
+        while (relativeAngle < -180) relativeAngle += 360;
+
+        const arrowAngleRad = ((relativeAngle - 90) * Math.PI) / 180;
+        const arrowLength = Math.min(w, h) * 0.3;
+        const arrowX = cx + Math.cos(arrowAngleRad) * arrowLength;
+        const arrowY = cy + Math.sin(arrowAngleRad) * arrowLength;
+
+        // Dashed line
+        ctx.strokeStyle = color + (Math.round((0.5 + confidence * 0.5) * 255)).toString(16).padStart(2, '0');
+        ctx.lineWidth = 3;
+        ctx.setLineDash([8, 4]);
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(arrowX, arrowY);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Arrowhead
+        const headLen = 20;
+        const headAngle = Math.atan2(arrowY - cy, arrowX - cx);
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(arrowX, arrowY);
+        ctx.lineTo(
+            arrowX - headLen * Math.cos(headAngle - Math.PI / 6),
+            arrowY - headLen * Math.sin(headAngle - Math.PI / 6)
+        );
+        ctx.lineTo(
+            arrowX - headLen * Math.cos(headAngle + Math.PI / 6),
+            arrowY - headLen * Math.sin(headAngle + Math.PI / 6)
+        );
+        ctx.closePath();
+        ctx.fill();
+
+        // Label near arrowhead
+        if (label) {
+            ctx.fillStyle = color;
+            ctx.font = 'bold 11px system-ui';
+            ctx.textAlign = 'center';
+            const labelX = arrowX + Math.cos(arrowAngleRad) * 20;
+            const labelY = arrowY + Math.sin(arrowAngleRad) * 20;
+            ctx.fillText(label, labelX, labelY);
+        }
+
+        // Highlight when bird is ahead
+        if (Math.abs(relativeAngle) < 15) {
+            ctx.strokeStyle = '#2ecc71';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(cx, cy, 40, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.fillStyle = 'rgba(46, 204, 113, 0.8)';
+            ctx.font = 'bold 14px system-ui';
+            ctx.textAlign = 'center';
+            ctx.fillText('BIRD AHEAD', cx, cy + 55);
+        }
+    }
+
+    function drawDistanceOverlay(w, h) {
+        var d = state.distanceInfo;
+        if (!d || !d.distance) return;
+
+        var x = w - 10;
+        var y = 100;
+
+        ctx.textAlign = 'right';
+
+        // Distance value
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+        ctx.fillRect(x - 160, y - 18, 165, 65);
+        ctx.fillStyle = '#4ecdc4';
+        ctx.font = 'bold 22px system-ui';
+        ctx.fillText('~' + d.distance + 'm', x - 5, y + 5);
+
+        // Confidence bar
+        var conf = d.confidence || 0;
+        ctx.fillStyle = '#333';
+        ctx.fillRect(x - 155, y + 15, 150, 6);
+        var barColor = conf > 0.6 ? '#2ecc71' : conf > 0.3 ? '#f39c12' : '#e74c3c';
+        ctx.fillStyle = barColor;
+        ctx.fillRect(x - 155, y + 15, 150 * conf, 6);
+
+        // Methods used
+        ctx.fillStyle = 'rgba(255,255,255,0.5)';
+        ctx.font = '10px system-ui';
+        var methods = d.methods_used ? d.methods_used.join(' + ') : '';
+        ctx.fillText(methods, x - 5, y + 38);
+
+        ctx.textAlign = 'left';
+    }
+
+    function drawScanRing(cx, cy, radius) {
+        if (!state.scanAmplitudes) return;
+        const maxAmp = Math.max(...state.scanAmplitudes.map((a) => a.rms), 0.001);
+        for (const amp of state.scanAmplitudes) {
+            const angleRad = ((amp.heading - state.currentHeading - 90) * Math.PI) / 180;
+            const intensity = amp.rms / maxAmp;
+            const dotRadius = 3 + intensity * 8;
+            ctx.fillStyle = 'rgba(243, 156, 18, ' + (0.3 + intensity * 0.7) + ')';
+            ctx.beginPath();
+            ctx.arc(cx + Math.cos(angleRad) * radius, cy + Math.sin(angleRad) * radius, dotRadius, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+
+    function drawFrequencyVisualizer() {
+        if (!state.analyser || !state.isListening) {
+            freqCtx.clearRect(0, 0, freqCanvas.width, freqCanvas.height);
+            return;
+        }
+        const bufferLength = state.analyser.frequencyBinCount;
+        const dataArray = new Uint8Array(bufferLength);
+        state.analyser.getByteFrequencyData(dataArray);
+        const w = freqCanvas.width;
+        const h = freqCanvas.height;
+        freqCtx.clearRect(0, 0, w, h);
+        const barWidth = w / bufferLength * 2;
+        let x = 0;
+        for (let i = 0; i < bufferLength; i++) {
+            const barHeight = (dataArray[i] / 255) * h;
+            const hue = 170 + (dataArray[i] / 255) * 30;
+            freqCtx.fillStyle = 'hsla(' + hue + ', 70%, 60%, 0.6)';
+            freqCtx.fillRect(x, h - barHeight, barWidth - 1, barHeight);
+            x += barWidth;
+            if (x > w) break;
+        }
+    }
+
+    function registerServiceWorker() {
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+        }
+    }
+
+    updateHistoryList();
+
+    // Expose state for native mic bridge (Capacitor iOS)
+    window.__birdLocatorState = state;
+    state._toggleListening = toggleListening;
+})();
