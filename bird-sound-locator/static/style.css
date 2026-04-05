@@ -1,0 +1,613 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    overflow: hidden;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+}
+
+.screen {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: none;
+    z-index: 1;
+}
+
+.screen.active {
+    display: flex;
+}
+
+/* Start Screen */
+#start-screen {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+}
+
+.start-content {
+    text-align: center;
+    padding: 2rem;
+    max-width: 400px;
+}
+
+.logo {
+    margin-bottom: 1.5rem;
+}
+
+.start-content h1 {
+    font-size: 1.8rem;
+    margin-bottom: 0.8rem;
+    color: #4ecdc4;
+}
+
+.start-content p {
+    font-size: 0.95rem;
+    color: #aaa;
+    line-height: 1.5;
+    margin-bottom: 2rem;
+}
+
+.btn-primary {
+    background: #4ecdc4;
+    color: #1a1a2e;
+    border: none;
+    padding: 14px 48px;
+    font-size: 1.1rem;
+    font-weight: 600;
+    border-radius: 50px;
+    cursor: pointer;
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.btn-primary:hover {
+    transform: scale(1.05);
+    box-shadow: 0 4px 20px rgba(78, 205, 196, 0.4);
+}
+
+.btn-primary:active {
+    transform: scale(0.98);
+}
+
+.mode-selector {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    margin-bottom: 0.5rem;
+}
+
+.btn-secondary {
+    background: transparent;
+    color: #4ecdc4;
+    border: 2px solid #4ecdc4;
+    padding: 14px 28px;
+    font-size: 1rem;
+    font-weight: 600;
+    border-radius: 50px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-secondary:hover {
+    background: rgba(78, 205, 196, 0.15);
+}
+
+.mode-description {
+    color: #666;
+    font-size: 0.8rem;
+    margin-bottom: 1.5rem;
+}
+
+.room-section {
+    background: rgba(255,255,255,0.05);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 1rem;
+    transition: opacity 0.3s;
+}
+
+.room-section.hidden {
+    display: none;
+}
+
+.section-label {
+    font-size: 0.8rem;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 10px;
+}
+
+.room-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    justify-content: center;
+    flex-wrap: wrap;
+}
+
+.btn-small {
+    background: rgba(78, 205, 196, 0.2);
+    color: #4ecdc4;
+    border: 1px solid rgba(78, 205, 196, 0.3);
+    padding: 8px 16px;
+    font-size: 0.85rem;
+    border-radius: 8px;
+    cursor: pointer;
+}
+
+.or-divider {
+    color: #555;
+    font-size: 0.8rem;
+}
+
+#room-id-input {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.15);
+    color: #eee;
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    width: 100px;
+    text-align: center;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.status-text {
+    margin-top: 1rem;
+    font-size: 0.85rem;
+    color: #888;
+    min-height: 1.2em;
+}
+
+/* App Screen */
+#app-screen {
+    background: #000;
+}
+
+#camera-feed {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    z-index: 1;
+}
+
+#overlay-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 2;
+    pointer-events: none;
+}
+
+/* Status Bar */
+#status-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    padding: 12px 16px;
+    padding-top: max(12px, env(safe-area-inset-top));
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: linear-gradient(to bottom, rgba(0,0,0,0.7) 0%, transparent 100%);
+    z-index: 5;
+    font-size: 0.85rem;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.status-dot.connected { background: #4ecdc4; }
+.status-dot.disconnected { background: #e74c3c; }
+.status-dot.connecting { background: #f39c12; animation: pulse 1s infinite; }
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+#status-text {
+    flex: 1;
+}
+
+.mic-badge {
+    font-size: 0.7rem;
+    padding: 2px 6px;
+    border-radius: 6px;
+    background: rgba(78, 205, 196, 0.2);
+    color: #4ecdc4;
+}
+
+.mic-badge.mono {
+    background: rgba(243, 156, 18, 0.2);
+    color: #f39c12;
+}
+
+#compass-heading {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    color: #4ecdc4;
+}
+
+/* Detection Panel */
+#detection-panel {
+    position: absolute;
+    top: 60px;
+    left: 16px;
+    right: 16px;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border-radius: 16px;
+    padding: 16px;
+    z-index: 5;
+    border: 1px solid rgba(78, 205, 196, 0.3);
+    transition: opacity 0.3s, transform 0.3s;
+}
+
+#detection-panel.hidden {
+    opacity: 0;
+    transform: translateY(-10px);
+    pointer-events: none;
+}
+
+#species-name {
+    font-size: 1.3rem;
+    font-weight: 700;
+    color: #4ecdc4;
+    margin-bottom: 4px;
+}
+
+#species-confidence {
+    font-size: 0.85rem;
+    color: #aaa;
+    margin-bottom: 4px;
+}
+
+#direction-info {
+    font-size: 0.85rem;
+    color: #f39c12;
+}
+
+/* Multi-Bird Detection Panel */
+#multi-detection-panel {
+    position: absolute;
+    top: 60px;
+    left: 16px;
+    right: 16px;
+    background: rgba(0, 0, 0, 0.75);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border-radius: 16px;
+    padding: 12px;
+    z-index: 5;
+    border: 1px solid rgba(78, 205, 196, 0.3);
+    max-height: 40vh;
+    overflow-y: auto;
+    transition: opacity 0.3s, transform 0.3s;
+}
+
+#multi-detection-panel.hidden {
+    opacity: 0;
+    transform: translateY(-10px);
+    pointer-events: none;
+}
+
+.panel-header-inline {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.panel-title {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: #888;
+}
+
+.badge {
+    background: rgba(78, 205, 196, 0.2);
+    color: #4ecdc4;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+.bird-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px;
+    border-radius: 8px;
+    margin-bottom: 4px;
+    background: rgba(255,255,255,0.03);
+}
+
+.bird-color-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.bird-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.bird-species {
+    font-size: 0.9rem;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.bird-meta {
+    font-size: 0.75rem;
+    color: #888;
+}
+
+.bird-direction {
+    font-size: 0.8rem;
+    color: #f39c12;
+    font-family: 'SF Mono', monospace;
+    white-space: nowrap;
+}
+
+/* Triangulation Panel */
+#triangulation-panel {
+    position: absolute;
+    bottom: 180px;
+    left: 16px;
+    right: 16px;
+    background: rgba(46, 204, 113, 0.15);
+    border: 1px solid rgba(46, 204, 113, 0.4);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border-radius: 12px;
+    padding: 12px 16px;
+    z-index: 5;
+    transition: opacity 0.3s;
+}
+
+#triangulation-panel.hidden {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.tri-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #2ecc71;
+    margin-bottom: 4px;
+}
+
+#tri-bearing {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #2ecc71;
+}
+
+#tri-distance, #tri-devices {
+    font-size: 0.8rem;
+    color: #aaa;
+}
+
+/* Scan Indicator */
+#scan-indicator {
+    position: absolute;
+    bottom: 180px;
+    left: 50%;
+    transform: translateX(-50%);
+    text-align: center;
+    z-index: 5;
+    color: #f39c12;
+    font-size: 0.85rem;
+    transition: opacity 0.3s;
+}
+
+#scan-indicator.hidden {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.scan-ring {
+    width: 60px;
+    height: 60px;
+    border: 2px solid rgba(243, 156, 18, 0.5);
+    border-top: 2px solid #f39c12;
+    border-radius: 50%;
+    margin: 0 auto 8px;
+    animation: spin 2s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+/* Controls */
+#controls {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    padding: 20px;
+    padding-bottom: max(20px, env(safe-area-inset-bottom));
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
+    background: linear-gradient(to top, rgba(0,0,0,0.7) 0%, transparent 100%);
+    z-index: 5;
+}
+
+.btn-round {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    border: 2px solid rgba(255,255,255,0.3);
+    background: rgba(255,255,255,0.1);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-round:hover {
+    background: rgba(255,255,255,0.2);
+}
+
+.btn-round.btn-large {
+    width: 68px;
+    height: 68px;
+    border-color: #4ecdc4;
+}
+
+.btn-round.btn-large.active {
+    background: #4ecdc4;
+    color: #1a1a2e;
+    box-shadow: 0 0 20px rgba(78, 205, 196, 0.5);
+}
+
+.btn-round.active {
+    background: rgba(78, 205, 196, 0.2);
+    border-color: #4ecdc4;
+    color: #4ecdc4;
+}
+
+/* Audio Visualizer */
+#audio-visualizer {
+    position: absolute;
+    bottom: 110px;
+    left: 16px;
+    right: 16px;
+    height: 40px;
+    z-index: 4;
+    opacity: 0.6;
+}
+
+#freq-canvas {
+    width: 100%;
+    height: 100%;
+}
+
+/* History Panel */
+#history-panel {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    max-height: 60vh;
+    background: rgba(26, 26, 46, 0.95);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border-radius: 20px 20px 0 0;
+    z-index: 10;
+    overflow-y: auto;
+    transition: transform 0.3s, opacity 0.3s;
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+}
+
+#history-panel.hidden {
+    transform: translateY(100%);
+    opacity: 0;
+    pointer-events: none;
+}
+
+.panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+    position: sticky;
+    top: 0;
+    background: inherit;
+}
+
+.panel-header h3 {
+    font-size: 1rem;
+    color: #4ecdc4;
+}
+
+.btn-close {
+    background: none;
+    border: none;
+    color: #888;
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 4px 8px;
+}
+
+#history-list {
+    padding: 8px 16px;
+}
+
+.history-item {
+    padding: 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.history-item .species {
+    font-weight: 600;
+    color: #4ecdc4;
+}
+
+.history-item .meta {
+    font-size: 0.8rem;
+    color: #888;
+    margin-top: 2px;
+}
+
+.history-item .confidence-badge {
+    font-size: 0.75rem;
+    padding: 4px 8px;
+    border-radius: 12px;
+    background: rgba(78, 205, 196, 0.2);
+    color: #4ecdc4;
+}
+
+.empty-history {
+    text-align: center;
+    padding: 32px 16px;
+    color: #666;
+    font-size: 0.9rem;
+}
+
+/* Distance info bar */
+.distance-bar {
+    margin-top: 4px;
+    font-size: 0.75rem;
+    color: rgba(78, 205, 196, 0.7);
+}
