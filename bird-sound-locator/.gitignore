@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+node_modules/
+ios-app/ios/
+ios-app/node_modules/
+.DS_Store
