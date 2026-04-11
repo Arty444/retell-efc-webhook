@@ -90,7 +90,8 @@ def write_to_supabase(data, client_id):
     if data.get("duration_ms"):
         duration_seconds = int(data["duration_ms"]) // 1000
  
-    is_lead = bool(data.get("trial_day"))
+    trial_day = data.get("trial_day", "")
+    is_lead = bool(trial_day) and trial_day.upper() not in ("N/A", "NA", "NONE", "")
  
     call_record = {
         "client_id": client_id,
@@ -158,7 +159,7 @@ async def retell_webhook(request: Request):
         "program": data["program"],
         "call_date": datetime.utcnow().strftime("%Y-%m-%d"),
         "call_summary": data["summary"],
-        "trial_booked": bool(data["trial_day"]),
+        "trial_booked": bool(data["trial_day"]) and data["trial_day"].upper() not in ("N/A", "NA", "NONE", ""),
     }
     await forward_to_zapier(zapier_payload)
  
