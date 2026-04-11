@@ -158,6 +158,7 @@ async def retell_webhook(request: Request):
         "program": data["program"],
         "call_date": datetime.utcnow().strftime("%Y-%m-%d"),
         "call_summary": data["summary"],
+        "trial_booked": bool(data["trial_day"]),
     }
     await forward_to_zapier(zapier_payload)
  
