@@ -151,6 +151,9 @@ async def retell_webhook(request: Request):
     data = extract_call_data(body)
     logger.info("Processing call from %s agent %s", data["from_number"], data["agent_id"])
  
+    trial_day_raw = data["trial_day"]
+    trial_booked = bool(trial_day_raw) and trial_day_raw.upper() not in ("N/A", "NA", "NONE", "")
+
     zapier_payload = {
         "caller_name": data["caller_name"],
         "caller_phone": data["caller_phone"] or data["from_number"],
@@ -159,7 +162,7 @@ async def retell_webhook(request: Request):
         "program": data["program"],
         "call_date": datetime.utcnow().strftime("%Y-%m-%d"),
         "call_summary": data["summary"],
-        "trial_booked": bool(data["trial_day"]) and data["trial_day"].upper() not in ("N/A", "NA", "NONE", ""),
+        "trial_booked": trial_booked,
     }
     await forward_to_zapier(zapier_payload)
  
