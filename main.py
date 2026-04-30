@@ -1,5 +1,7 @@
 import os
 import logging
+import json
+import re
 from datetime import datetime
  
 import httpx
@@ -40,16 +42,143 @@ else:
 AGENT_CLIENT_MAP = {
     "agent_27efcd8d33e3d52313d74a74a2": "6d047c8a-bedf-4feb-9223-803c57a8ce1a",
 }
+
+BOOKED_OUTCOMES = {"booked", "rescheduled"}
+EMPTY_VALUES = {"", "N/A", "NA", "NONE", "NULL"}
+VALID_PROGRAMS = {
+    "Adult Jiu Jitsu",
+    "Tiny Sharks",
+    "Little Sharks",
+    "Junior Sharks",
+    "Multiple",
+    "N/A",
+}
  
  
 def get_client_id(agent_id):
     return AGENT_CLIENT_MAP.get(agent_id)
+
+
+def clean_text(value, default=""):
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def is_empty_value(value):
+    return clean_text(value).upper() in EMPTY_VALUES
+
+
+def parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("true", "yes", "1")
+
+
+def is_valid_date(value):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", clean_text(value)):
+        return False
+    try:
+        datetime.strptime(clean_text(value), "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def normalize_final_outcome(value):
+    outcome = clean_text(value).lower().replace(" ", "_")
+    if outcome in {"book", "booked", "booking"}:
+        return "booked"
+    if outcome in {"reschedule", "rescheduled"}:
+        return "rescheduled"
+    if outcome in {"cancel", "canceled", "cancelled", "cancellation"}:
+        return "cancelled"
+    if outcome in {"info", "info_only", "general_question", "schedule"}:
+        return "info_only"
+    if outcome in {"hangup", "hang_up", "abandoned"}:
+        return "abandoned"
+    if outcome in {"spam", "spam_or_hangup"}:
+        return "spam"
+    if outcome == "message":
+        return "message"
+    return ""
+
+
+def normalize_program(value):
+    program = clean_text(value, "N/A")
+    program_map = {
+        "Adult": "Adult Jiu Jitsu",
+        "Tiny Shark": "Tiny Sharks",
+        "Little Shark": "Little Sharks",
+        "Jr Shark": "Junior Sharks",
+        "Jr Sharks": "Junior Sharks",
+    }
+    return program if program in VALID_PROGRAMS else program_map.get(program, program)
+
+
+def parse_bookings(value):
+    if is_empty_value(value):
+        return []
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, json.JSONDecodeError):
+        logger.warning("Could not parse bookings JSON: %s", value)
+        return []
+
+    if not isinstance(parsed, list):
+        return []
+
+    bookings = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        status = clean_text(item.get("status"), "booked").lower()
+        booking = {
+            "student_name": clean_text(item.get("student_name"), "N/A"),
+            "student_type": clean_text(item.get("student_type"), "N/A"),
+            "program": normalize_program(item.get("program")),
+            "trial_date": clean_text(item.get("trial_date")),
+            "trial_time": clean_text(item.get("trial_time")),
+            "status": status,
+        }
+        if status in BOOKED_OUTCOMES and is_valid_date(booking["trial_date"]):
+            bookings.append(booking)
+    return bookings
+
+
+def build_legacy_booking(custom):
+    trial_day = clean_text(custom.get("trial_day"))
+    trial_time = clean_text(custom.get("trial_time"))
+    if not is_valid_date(trial_day) or is_empty_value(trial_time):
+        return []
+    return [{
+        "student_name": "N/A",
+        "student_type": "N/A",
+        "program": normalize_program(custom.get("program")),
+        "trial_date": trial_day,
+        "trial_time": trial_time,
+        "status": "booked",
+    }]
  
  
 def extract_call_data(body):
     call = body.get("call", {})
     analysis = call.get("call_analysis", {})
     custom = analysis.get("custom_analysis_data", {})
+    final_outcome = normalize_final_outcome(custom.get("final_outcome"))
+    bookings = parse_bookings(custom.get("bookings"))
+    if final_outcome in BOOKED_OUTCOMES and not bookings:
+        bookings = build_legacy_booking(custom)
+
+    first_booking = bookings[0] if bookings else {}
+    trial_booked = (
+        final_outcome in BOOKED_OUTCOMES
+        and bool(bookings)
+        and not parse_bool(custom.get("trial_cancelled"))
+    )
+
     return {
         "agent_id": call.get("agent_id", ""),
         "call_id": call.get("call_id", ""),
@@ -59,12 +188,18 @@ def extract_call_data(body):
         "duration_ms": call.get("call_duration_ms"),
         "caller_name": custom.get("caller_name", ""),
         "caller_phone": custom.get("caller_phone", ""),
-        "program": custom.get("program", ""),
-        "trial_day": custom.get("trial_day", ""),
-        "trial_time": custom.get("trial_time", ""),
+        "program": first_booking.get("program") or normalize_program(custom.get("program")),
+        "trial_day": first_booking.get("trial_date") or "N/A",
+        "trial_time": first_booking.get("trial_time") or "N/A",
         "call_type": custom.get("Call_Type", ""),
-        "call_successful": custom.get("Call_Successful", False),
+        "call_successful": analysis.get("call_successful", custom.get("Call_Successful", False)),
         "is_spam": str(custom.get("Spam", "No")).lower() == "yes",
+        "final_outcome": final_outcome,
+        "trial_booked": trial_booked,
+        "trial_cancelled": parse_bool(custom.get("trial_cancelled")),
+        "needs_follow_up": parse_bool(custom.get("needs_follow_up")),
+        "follow_up_reason": clean_text(custom.get("follow_up_reason"), "N/A"),
+        "bookings": bookings,
         "sentiment": analysis.get("user_sentiment", ""),
         "summary": analysis.get("call_summary", ""),
         "transcript": call.get("transcript", ""),
@@ -90,8 +225,7 @@ def write_to_supabase(data, client_id):
     if data.get("duration_ms"):
         duration_seconds = int(data["duration_ms"]) // 1000
  
-    trial_day = data.get("trial_day", "")
-    is_lead = bool(trial_day) and trial_day.upper() not in ("N/A", "NA", "NONE", "")
+    is_lead = data.get("trial_booked", False)
  
     call_record = {
         "client_id": client_id,
@@ -118,18 +252,21 @@ def write_to_supabase(data, client_id):
         logger.info("Call written to Supabase: %s", inserted_call_id)
  
         if is_lead and inserted_call_id:
-            lead_record = {
-                "client_id": client_id,
-                "call_id": inserted_call_id,
-                "caller_name": call_record["caller_name"],
-                "caller_phone": call_record["caller_phone"],
-                "program": call_record["program"],
-                "trial_day": call_record["trial_day"],
-                "trial_time": call_record["trial_time"],
-                "status": "Booked",
-            }
-            supabase_client.table("leads").insert(lead_record).execute()
-            logger.info("Lead created for call %s", inserted_call_id)
+            lead_records = []
+            for booking in data.get("bookings", []):
+                lead_records.append({
+                    "client_id": client_id,
+                    "call_id": inserted_call_id,
+                    "caller_name": call_record["caller_name"],
+                    "caller_phone": call_record["caller_phone"],
+                    "program": booking.get("program") or call_record["program"],
+                    "trial_day": booking.get("trial_date") or call_record["trial_day"],
+                    "trial_time": booking.get("trial_time") or call_record["trial_time"],
+                    "status": "Booked",
+                })
+            if lead_records:
+                supabase_client.table("leads").insert(lead_records).execute()
+                logger.info("Created %s lead(s) for call %s", len(lead_records), inserted_call_id)
  
     except Exception as e:
         logger.error("Supabase write failed: %s", e)
@@ -151,9 +288,6 @@ async def retell_webhook(request: Request):
     data = extract_call_data(body)
     logger.info("Processing call from %s agent %s", data["from_number"], data["agent_id"])
  
-    trial_day_raw = data["trial_day"]
-    trial_booked = bool(trial_day_raw) and trial_day_raw.upper() not in ("N/A", "NA", "NONE", "")
-
     zapier_payload = {
         "caller_name": data["caller_name"],
         "caller_phone": data["caller_phone"] or data["from_number"],
@@ -162,7 +296,13 @@ async def retell_webhook(request: Request):
         "program": data["program"],
         "call_date": datetime.utcnow().strftime("%Y-%m-%d"),
         "call_summary": data["summary"],
-        "trial_booked": trial_booked,
+        "call_type": data["call_type"],
+        "final_outcome": data["final_outcome"],
+        "trial_booked": data["trial_booked"],
+        "trial_cancelled": data["trial_cancelled"],
+        "needs_follow_up": data["needs_follow_up"],
+        "follow_up_reason": data["follow_up_reason"],
+        "bookings": data["bookings"],
     }
     await forward_to_zapier(zapier_payload)
  
