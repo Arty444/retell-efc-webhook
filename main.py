@@ -3,6 +3,7 @@ import logging
 import json
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
  
 import httpx
 from fastapi import FastAPI, Request
@@ -53,6 +54,7 @@ VALID_PROGRAMS = {
     "Multiple",
     "N/A",
 }
+LOCAL_TIMEZONE = ZoneInfo("America/New_York")
  
  
 def get_client_id(agent_id):
@@ -161,12 +163,23 @@ def build_legacy_booking(custom):
         "trial_time": trial_time,
         "status": "booked",
     }]
+
+
+def parse_retell_start(call):
+    start_timestamp = call.get("start_timestamp")
+    if not start_timestamp:
+        return None
+    try:
+        return datetime.fromtimestamp(int(start_timestamp) / 1000, tz=LOCAL_TIMEZONE)
+    except (TypeError, ValueError):
+        return None
  
  
 def extract_call_data(body):
     call = body.get("call", {})
     analysis = call.get("call_analysis", {})
     custom = analysis.get("custom_analysis_data", {})
+    started_at = parse_retell_start(call)
     final_outcome = normalize_final_outcome(custom.get("final_outcome"))
     bookings = parse_bookings(custom.get("bookings"))
     if final_outcome in BOOKED_OUTCOMES and not bookings:
@@ -185,7 +198,9 @@ def extract_call_data(body):
         "from_number": call.get("from_number", ""),
         "to_number": call.get("to_number", ""),
         "direction": call.get("direction", ""),
-        "duration_ms": call.get("call_duration_ms"),
+        "duration_ms": call.get("duration_ms") or call.get("call_duration_ms"),
+        "call_date": started_at.strftime("%Y-%m-%d") if started_at else clean_text(custom.get("call_date")),
+        "call_time": started_at.strftime("%H:%M:%S") if started_at else "",
         "caller_name": custom.get("caller_name", ""),
         "caller_phone": custom.get("caller_phone", ""),
         "program": first_booking.get("program") or normalize_program(custom.get("program")),
@@ -227,9 +242,10 @@ def write_to_supabase(data, client_id):
  
     is_lead = data.get("trial_booked", False)
  
-    call_record = {
+    call_record_base = {
         "client_id": client_id,
-        "call_date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "call_date": data.get("call_date") or datetime.now(LOCAL_TIMEZONE).strftime("%Y-%m-%d"),
+        "call_time": data.get("call_time") or None,
         "caller_phone": data.get("caller_phone") or data.get("from_number", ""),
         "caller_name": data.get("caller_name", ""),
         "program": data.get("program", ""),
@@ -245,9 +261,27 @@ def write_to_supabase(data, client_id):
         "is_lead": is_lead,
         "lead_converted": False,
     }
+
+    call_record_extra = {
+        "final_outcome": data.get("final_outcome", ""),
+        "trial_booked": data.get("trial_booked", False),
+        "trial_cancelled": data.get("trial_cancelled", False),
+        "needs_follow_up": data.get("needs_follow_up", False),
+        "follow_up_reason": data.get("follow_up_reason", "N/A"),
+        "bookings": data.get("bookings", []),
+    }
+    call_record = {**call_record_base, **call_record_extra}
  
     try:
-        call_result = supabase_client.table("calls").insert(call_record).execute()
+        try:
+            call_result = supabase_client.table("calls").insert(call_record).execute()
+        except Exception as e:
+            error_text = str(e)
+            if "final_outcome" not in error_text and "schema cache" not in error_text and "PGRST204" not in error_text:
+                raise
+            logger.warning("Supabase schema missing new call fields; retrying without outcome metadata")
+            call_record = call_record_base
+            call_result = supabase_client.table("calls").insert(call_record).execute()
         inserted_call_id = call_result.data[0]["id"] if call_result.data else None
         logger.info("Call written to Supabase: %s", inserted_call_id)
  
