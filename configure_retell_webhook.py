@@ -11,7 +11,7 @@ Example:
 import sys
 import httpx
 
-RETELL_API_KEY = "key_dc76bd1b9f12d1e105c211c337ea"
+RETELL_API_KEY = "key_96f8090656cc8d88d786901dabb1"
 RETELL_BASE_URL = "https://api.retellai.com"
 
 
