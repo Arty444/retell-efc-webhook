@@ -41,7 +41,8 @@ else:
     logger.warning("Supabase credentials not set")
  
 AGENT_CLIENT_MAP = {
-    "agent_27efcd8d33e3d52313d74a74a2": "6d047c8a-bedf-4feb-9223-803c57a8ce1a",
+    "agent_27efcd8d33e3d52313d74a74a2": "6d047c8a-bedf-4feb-9223-803c57a8ce1a",  # McHugh Jiu Jitsu HQ
+    "agent_cee32b0da5944f68d555f62f36": "d094ef3f-0b1d-4054-b47e-16596855a51b",  # Team Bundy Jiu-Jitsu
 }
 
 BOOKED_OUTCOMES = {"booked", "rescheduled"}
