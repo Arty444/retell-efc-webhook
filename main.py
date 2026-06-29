@@ -2,33 +2,46 @@ import os
 import logging
 import json
 import re
+import hmac
 from datetime import datetime
 from zoneinfo import ZoneInfo
- 
+
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
+
+try:
+    from retell import Retell
+except Exception:  # SDK absent -> verification fails closed when a secret is configured
+    Retell = None
  
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
  
 app = FastAPI(title="Retell Voice Agent Webhook Server")
  
+# Only allow specific origins. Empty entries dropped; Vercel previews matched by regex.
+_frontend = os.environ.get("FRONTEND_URL", "").strip()
+ALLOWED_ORIGINS = [o for o in ["http://localhost:5173", _frontend] if o]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "https://*.vercel.app",
-        os.environ.get("FRONTEND_URL", ""),
-    ],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
  
 ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL")
 RETELL_API_KEY = os.environ.get("RETELL_API_KEY")
+# Webhook signing key. In this setup it's the same key as RETELL_API_KEY, so we fall
+# back to RETELL_API_KEY when a dedicated secret isn't set.
+RETELL_WEBHOOK_SECRET = os.environ.get("RETELL_WEBHOOK_SECRET")
+# Shared secret required on /webhook/crm callers (set the same value in your CRM/Zapier).
+CRM_WEBHOOK_SECRET = os.environ.get("CRM_WEBHOOK_SECRET")
+# Reject oversized request bodies (DoS / storage abuse). Default 1 MB.
+MAX_BODY_BYTES = int(os.environ.get("MAX_WEBHOOK_BODY_BYTES", "1000000"))
  
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
@@ -60,6 +73,41 @@ LOCAL_TIMEZONE = ZoneInfo("America/New_York")
  
 def get_client_id(agent_id):
     return AGENT_CLIENT_MAP.get(agent_id)
+
+
+def mask_phone(raw):
+    """Mask a phone number for logs: keep only the last 4 digits."""
+    d = re.sub(r"\D", "", raw or "")
+    if not d:
+        return "withheld"
+    return f"***{d[-4:]}" if len(d) >= 4 else "***"
+
+
+def body_too_large(request: Request) -> bool:
+    cl = request.headers.get("content-length")
+    return cl is not None and cl.isdigit() and int(cl) > MAX_BODY_BYTES
+
+
+def verify_retell_signature(raw_body: str, signature: str) -> bool:
+    """Verify an inbound Retell webhook against the designated webhook signing key.
+    Falls back to RETELL_API_KEY when RETELL_WEBHOOK_SECRET isn't set (same key here).
+    Fails OPEN (loud warning) only if NEITHER is configured, so a missing env var can't
+    silently drop all traffic."""
+    verify_key = RETELL_WEBHOOK_SECRET or RETELL_API_KEY
+    if not verify_key:
+        logger.warning("No webhook verify key set - skipping signature check (INSECURE)")
+        return True
+    if Retell is None:
+        logger.error("retell SDK not installed - cannot verify webhook signature")
+        return False
+    if not signature:
+        logger.warning("Webhook rejected: missing X-Retell-Signature header")
+        return False
+    try:
+        return bool(Retell.verify(raw_body, api_key=verify_key, signature=signature))
+    except Exception as e:
+        logger.error("signature verification error: %s", e)
+        return False
 
 
 def clean_text(value, default=""):
@@ -314,14 +362,30 @@ async def health():
  
 @app.post("/webhook/retell")
 async def retell_webhook(request: Request):
-    body = await request.json()
+    if body_too_large(request):
+        return Response(status_code=413)
+    raw = await request.body()
+    if len(raw) > MAX_BODY_BYTES:
+        return Response(status_code=413)
+    raw_body = raw.decode("utf-8", "replace")
+
+    # Verify the request genuinely came from Retell (raw body — re-serializing JSON
+    # would change bytes and break the signature).
+    if not verify_retell_signature(raw_body, request.headers.get("X-Retell-Signature", "")):
+        logger.warning("Webhook rejected: invalid signature")
+        return Response(status_code=401)
+
+    try:
+        body = json.loads(raw_body)
+    except Exception:
+        return Response(status_code=400)
     event = body.get("event", "")
  
     if event != "call_analyzed":
         return {"status": "ignored", "event": event}
  
     data = extract_call_data(body)
-    logger.info("Processing call from %s agent %s", data["from_number"], data["agent_id"])
+    logger.info("Processing call from %s agent %s", mask_phone(data["from_number"]), data["agent_id"])
  
     zapier_payload = {
         "caller_name": data["caller_name"],
@@ -353,9 +417,27 @@ async def retell_webhook(request: Request):
 @app.post("/webhook/crm")
 async def crm_webhook(request: Request):
     if not supabase_client:
-        return {"status": "error", "message": "Supabase not configured"}
- 
-    body = await request.json()
+        return Response(status_code=503)
+
+    # Require a shared secret so external callers can't forge CRM events (which can
+    # flip leads to "Converted"). Fails open with a warning only while unconfigured.
+    if CRM_WEBHOOK_SECRET:
+        provided = request.headers.get("X-Webhook-Secret", "")
+        if not hmac.compare_digest(provided, CRM_WEBHOOK_SECRET):
+            logger.warning("CRM webhook rejected: bad/missing X-Webhook-Secret")
+            return Response(status_code=401)
+    else:
+        logger.warning("CRM_WEBHOOK_SECRET not set - /webhook/crm is UNAUTHENTICATED")
+
+    if body_too_large(request):
+        return Response(status_code=413)
+    raw = await request.body()
+    if len(raw) > MAX_BODY_BYTES:
+        return Response(status_code=413)
+    try:
+        body = json.loads(raw)
+    except Exception:
+        return Response(status_code=400)
     logger.info("CRM webhook received: %s", body.get("event_type", "unknown"))
  
     client_id = body.get("client_id")
@@ -365,7 +447,7 @@ async def crm_webhook(request: Request):
     event_data = body.get("event_data", {})
  
     if not client_id:
-        return {"status": "error", "message": "client_id required"}
+        return Response(status_code=400)
  
     try:
         supabase_client.table("crm_events").insert({
@@ -381,11 +463,12 @@ async def crm_webhook(request: Request):
             result = supabase_client.table("leads").update({"status": "Converted"}).eq("client_id", client_id).eq("caller_phone", contact_phone).eq("status", "Booked").execute()
  
             if result.data:
-                logger.info("Lead auto-converted for %s", contact_phone)
+                logger.info("Lead auto-converted for %s", mask_phone(contact_phone))
                 supabase_client.table("calls").update({"lead_converted": True}).eq("client_id", client_id).eq("caller_phone", contact_phone).eq("is_lead", True).execute()
  
     except Exception as e:
+        # Log details server-side; never leak exception text to the caller.
         logger.error("CRM webhook processing failed: %s", e)
-        return {"status": "error", "message": str(e)}
+        return Response(status_code=500)
  
     return {"status": "ok", "event_type": event_type}
