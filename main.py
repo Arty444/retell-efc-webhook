@@ -42,6 +42,19 @@ RETELL_WEBHOOK_SECRET = os.environ.get("RETELL_WEBHOOK_SECRET")
 CRM_WEBHOOK_SECRET = os.environ.get("CRM_WEBHOOK_SECRET")
 # Reject oversized request bodies (DoS / storage abuse). Default 1 MB.
 MAX_BODY_BYTES = int(os.environ.get("MAX_WEBHOOK_BODY_BYTES", "1000000"))
+# Only REJECT on a failed signature when this is explicitly enabled. Default off =
+# "monitor mode": verify and log the result, but never drop traffic. Flip to true
+# once the logs confirm real Retell events verify OK.
+WEBHOOK_VERIFY_ENFORCE = os.environ.get("WEBHOOK_VERIFY_ENFORCE", "false").lower() == "true"
+
+# One Retell client for signature verification (verify() takes the key per-call, so the
+# init key doesn't matter functionally). Built once; failure here never blocks traffic.
+_retell_client = None
+if Retell is not None:
+    try:
+        _retell_client = Retell(api_key=(RETELL_WEBHOOK_SECRET or RETELL_API_KEY or "unused"))
+    except Exception as e:
+        logging.getLogger(__name__).error("could not init Retell verify client: %s", e)
  
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
@@ -89,25 +102,27 @@ def body_too_large(request: Request) -> bool:
 
 
 def verify_retell_signature(raw_body: str, signature: str) -> bool:
-    """Verify an inbound Retell webhook against the designated webhook signing key.
-    Falls back to RETELL_API_KEY when RETELL_WEBHOOK_SECRET isn't set (same key here).
-    Fails OPEN (loud warning) only if NEITHER is configured, so a missing env var can't
-    silently drop all traffic."""
+    """Return True if the webhook is authentic, OR if verification simply can't run
+    (no key, SDK/client unavailable, or an unexpected error) — those fail OPEN with a
+    loud log so a config/SDK problem never drops all traffic. Returns False ONLY on a
+    genuine signature mismatch or a missing signature header. The caller decides whether
+    a False is fatal, based on WEBHOOK_VERIFY_ENFORCE."""
     verify_key = RETELL_WEBHOOK_SECRET or RETELL_API_KEY
     if not verify_key:
-        logger.warning("No webhook verify key set - skipping signature check (INSECURE)")
+        logger.warning("No webhook verify key set - accepting unverified (INSECURE)")
         return True
-    if Retell is None:
-        logger.error("retell SDK not installed - cannot verify webhook signature")
-        return False
+    if _retell_client is None:
+        logger.error("Retell verify client unavailable - accepting unverified")
+        return True
     if not signature:
-        logger.warning("Webhook rejected: missing X-Retell-Signature header")
+        logger.warning("Webhook has no X-Retell-Signature header")
         return False
     try:
-        return bool(Retell.verify(raw_body, api_key=verify_key, signature=signature))
+        return bool(_retell_client.verify(raw_body, api_key=verify_key, signature=signature))
     except Exception as e:
-        logger.error("signature verification error: %s", e)
-        return False
+        # A bug/SDK issue must NOT take down logging. Fail open, loudly.
+        logger.error("verification errored - accepting unverified: %s", e)
+        return True
 
 
 def clean_text(value, default=""):
@@ -371,9 +386,12 @@ async def retell_webhook(request: Request):
 
     # Verify the request genuinely came from Retell (raw body — re-serializing JSON
     # would change bytes and break the signature).
-    if not verify_retell_signature(raw_body, request.headers.get("X-Retell-Signature", "")):
-        logger.warning("Webhook rejected: invalid signature")
+    sig_ok = verify_retell_signature(raw_body, request.headers.get("X-Retell-Signature", ""))
+    if not sig_ok and WEBHOOK_VERIFY_ENFORCE:
+        logger.warning("Webhook rejected: invalid signature (enforce on)")
         return Response(status_code=401)
+    if not sig_ok:
+        logger.warning("Webhook signature not verified; accepting (monitor mode - set WEBHOOK_VERIFY_ENFORCE=true to reject)")
 
     try:
         body = json.loads(raw_body)
