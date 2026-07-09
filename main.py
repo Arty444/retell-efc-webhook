@@ -3,12 +3,15 @@ import logging
 import json
 import re
 import hmac
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from supabase import create_client, Client
 
 try:
@@ -20,7 +23,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
  
 app = FastAPI(title="Retell Voice Agent Webhook Server")
- 
+
+# Rate limiting. Railway fronts the app with a proxy, so the real caller is the
+# first hop of X-Forwarded-For; fall back to the socket peer.
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+limiter = Limiter(key_func=_client_ip)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # Only allow specific origins. Empty entries dropped; Vercel previews matched by regex.
 _frontend = os.environ.get("FRONTEND_URL", "").strip()
 ALLOWED_ORIGINS = [o for o in ["http://localhost:5173", _frontend] if o]
@@ -42,9 +57,10 @@ RETELL_WEBHOOK_SECRET = os.environ.get("RETELL_WEBHOOK_SECRET")
 CRM_WEBHOOK_SECRET = os.environ.get("CRM_WEBHOOK_SECRET")
 # Reject oversized request bodies (DoS / storage abuse). Default 1 MB.
 MAX_BODY_BYTES = int(os.environ.get("MAX_WEBHOOK_BODY_BYTES", "1000000"))
-# Only REJECT on a failed signature when this is explicitly enabled. Default off =
-# "monitor mode": verify and log the result, but never drop traffic. Flip to true
-# once the logs confirm real Retell events verify OK.
+# Reject on failed/unverifiable signatures. Currently defaults to monitor mode
+# (verify + log, never drop) until one real Retell call is confirmed verifying
+# in Railway logs — then flip this default to "true" (fail closed).
+# TODO(enforce): flip default to "true" after log confirmation.
 WEBHOOK_VERIFY_ENFORCE = os.environ.get("WEBHOOK_VERIFY_ENFORCE", "false").lower() == "true"
 
 # One Retell client for signature verification (verify() takes the key per-call, so the
@@ -66,10 +82,14 @@ if SUPABASE_URL and SUPABASE_SERVICE_KEY:
 else:
     logger.warning("Supabase credentials not set")
  
-AGENT_CLIENT_MAP = {
-    "agent_27efcd8d33e3d52313d74a74a2": "6d047c8a-bedf-4feb-9223-803c57a8ce1a",  # McHugh Jiu Jitsu HQ
-    "agent_cee32b0da5944f68d555f62f36": "d094ef3f-0b1d-4054-b47e-16596855a51b",  # Team Bundy Jiu-Jitsu
-}
+# Agent → client routing lives in the clients table (clients.agent_id), so
+# onboarding a client is a data change, not a deploy. This env var (JSON object
+# of {"agent_...": "client-uuid"}) is an emergency override checked first.
+AGENT_CLIENT_MAP = {}
+try:
+    AGENT_CLIENT_MAP = json.loads(os.environ.get("AGENT_CLIENT_MAP", "{}"))
+except Exception as e:
+    logger.error("AGENT_CLIENT_MAP env is not valid JSON, ignoring: %s", e)
 
 BOOKED_OUTCOMES = {"booked", "rescheduled"}
 EMPTY_VALUES = {"", "N/A", "NA", "NONE", "NULL"}
@@ -84,8 +104,41 @@ VALID_PROGRAMS = {
 LOCAL_TIMEZONE = ZoneInfo("America/New_York")
  
  
+# agent_id → (client_id | None, expiry). Hits cache for 5 min; unknown agents
+# cache for 1 min so a typo'd agent_id can't hammer the DB on every event.
+_agent_cache = {}
+_AGENT_CACHE_TTL = 300
+_AGENT_CACHE_NEG_TTL = 60
+
+
 def get_client_id(agent_id):
-    return AGENT_CLIENT_MAP.get(agent_id)
+    if not agent_id:
+        return None
+    if agent_id in AGENT_CLIENT_MAP:
+        return AGENT_CLIENT_MAP[agent_id]
+
+    cached = _agent_cache.get(agent_id)
+    if cached and cached[1] > time.monotonic():
+        return cached[0]
+
+    if not supabase_client:
+        return cached[0] if cached else None
+    try:
+        result = (
+            supabase_client.table("clients")
+            .select("id")
+            .eq("agent_id", agent_id)
+            .limit(1)
+            .execute()
+        )
+        client_id = result.data[0]["id"] if result.data else None
+        ttl = _AGENT_CACHE_TTL if client_id else _AGENT_CACHE_NEG_TTL
+        _agent_cache[agent_id] = (client_id, time.monotonic() + ttl)
+        return client_id
+    except Exception as e:
+        # DB hiccup: serve the last known mapping (even if expired) over dropping the call.
+        logger.error("clients.agent_id lookup failed for %s: %s", agent_id, e)
+        return cached[0] if cached else None
 
 
 def mask_phone(raw):
@@ -102,27 +155,29 @@ def body_too_large(request: Request) -> bool:
 
 
 def verify_retell_signature(raw_body: str, signature: str) -> bool:
-    """Return True if the webhook is authentic, OR if verification simply can't run
-    (no key, SDK/client unavailable, or an unexpected error) — those fail OPEN with a
-    loud log so a config/SDK problem never drops all traffic. Returns False ONLY on a
-    genuine signature mismatch or a missing signature header. The caller decides whether
-    a False is fatal, based on WEBHOOK_VERIFY_ENFORCE."""
+    """Return True only when the webhook verifiably came from Retell. When
+    verification CANNOT run (no key, SDK/client unavailable, unexpected error),
+    the result follows the mode: enforce mode fails CLOSED (a config/SDK problem
+    must not silently disable authentication); monitor mode fails open with a
+    loud log. The caller drops False requests only when WEBHOOK_VERIFY_ENFORCE."""
     verify_key = RETELL_WEBHOOK_SECRET or RETELL_API_KEY
     if not verify_key:
-        logger.warning("No webhook verify key set - accepting unverified (INSECURE)")
-        return True
+        logger.error("No webhook verify key set (INSECURE)%s",
+                     "" if WEBHOOK_VERIFY_ENFORCE else " - accepting unverified")
+        return not WEBHOOK_VERIFY_ENFORCE
     if _retell_client is None:
-        logger.error("Retell verify client unavailable - accepting unverified")
-        return True
+        logger.error("Retell verify client unavailable%s",
+                     "" if WEBHOOK_VERIFY_ENFORCE else " - accepting unverified")
+        return not WEBHOOK_VERIFY_ENFORCE
     if not signature:
         logger.warning("Webhook has no X-Retell-Signature header")
         return False
     try:
         return bool(_retell_client.verify(raw_body, api_key=verify_key, signature=signature))
     except Exception as e:
-        # A bug/SDK issue must NOT take down logging. Fail open, loudly.
-        logger.error("verification errored - accepting unverified: %s", e)
-        return True
+        logger.error("verification errored%s: %s",
+                     "" if WEBHOOK_VERIFY_ENFORCE else " - accepting unverified", e)
+        return not WEBHOOK_VERIFY_ENFORCE
 
 
 def clean_text(value, default=""):
@@ -376,6 +431,7 @@ async def health():
  
  
 @app.post("/webhook/retell")
+@limiter.limit("120/minute")
 async def retell_webhook(request: Request):
     if body_too_large(request):
         return Response(status_code=413)
@@ -411,7 +467,7 @@ async def retell_webhook(request: Request):
         "trial_day": data["trial_day"],
         "trial_time": data["trial_time"],
         "program": data["program"],
-        "call_date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "call_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "call_summary": data["summary"],
         "call_type": data["call_type"],
         "final_outcome": data["final_outcome"],
@@ -433,6 +489,7 @@ async def retell_webhook(request: Request):
  
  
 @app.post("/webhook/crm")
+@limiter.limit("30/minute")
 async def crm_webhook(request: Request):
     if not supabase_client:
         return Response(status_code=503)
