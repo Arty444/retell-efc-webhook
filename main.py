@@ -49,6 +49,11 @@ app.add_middleware(
 )
  
 ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL")
+# The Zapier feed is per-client plumbing that belongs to ONE tenant (McHugh —
+# it drives their welcome-SMS/EFC automations). Calls from any other tenant's
+# agent must NEVER be forwarded there, or their callers' data lands in
+# McHugh's Zap history and downstream systems (2026-07-30 cross-tenant fix).
+ZAPIER_CLIENT_ID = os.environ.get("ZAPIER_CLIENT_ID", "6d047c8a-bedf-4feb-9223-803c57a8ce1a")
 RETELL_API_KEY = os.environ.get("RETELL_API_KEY")
 # Webhook signing key. In this setup it's the same key as RETELL_API_KEY, so we fall
 # back to RETELL_API_KEY when a dedicated secret isn't set.
@@ -461,25 +466,29 @@ async def retell_webhook(request: Request):
     data = extract_call_data(body)
     logger.info("Processing call from %s agent %s", mask_phone(data["from_number"]), data["agent_id"])
  
-    zapier_payload = {
-        "caller_name": data["caller_name"],
-        "caller_phone": data["caller_phone"] or data["from_number"],
-        "trial_day": data["trial_day"],
-        "trial_time": data["trial_time"],
-        "program": data["program"],
-        "call_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "call_summary": data["summary"],
-        "call_type": data["call_type"],
-        "final_outcome": data["final_outcome"],
-        "trial_booked": data["trial_booked"],
-        "trial_cancelled": data["trial_cancelled"],
-        "needs_follow_up": data["needs_follow_up"],
-        "follow_up_reason": data["follow_up_reason"],
-        "bookings": data["bookings"],
-    }
-    await forward_to_zapier(zapier_payload)
- 
     client_id = get_client_id(data["agent_id"])
+
+    if client_id == ZAPIER_CLIENT_ID:
+        zapier_payload = {
+            "caller_name": data["caller_name"],
+            "caller_phone": data["caller_phone"] or data["from_number"],
+            "trial_day": data["trial_day"],
+            "trial_time": data["trial_time"],
+            "program": data["program"],
+            "call_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "call_summary": data["summary"],
+            "call_type": data["call_type"],
+            "final_outcome": data["final_outcome"],
+            "trial_booked": data["trial_booked"],
+            "trial_cancelled": data["trial_cancelled"],
+            "needs_follow_up": data["needs_follow_up"],
+            "follow_up_reason": data["follow_up_reason"],
+            "bookings": data["bookings"],
+        }
+        await forward_to_zapier(zapier_payload)
+    else:
+        logger.info("Zapier forward skipped for client %s (feed owner only)", client_id)
+
     if client_id:
         write_to_supabase(data, client_id)
     else:
