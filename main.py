@@ -14,6 +14,8 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from supabase import create_client, Client
 
+from transcript_display import build_display
+
 try:
     from retell import Retell
 except Exception:  # SDK absent -> verification fails closed when a secret is configured
@@ -342,6 +344,7 @@ def extract_call_data(body):
         "sentiment": analysis.get("user_sentiment", ""),
         "summary": analysis.get("call_summary", ""),
         "transcript": call.get("transcript", ""),
+        "transcript_display": build_display(call),
     }
  
  
@@ -387,6 +390,7 @@ def write_to_supabase(data, client_id):
     }
 
     call_record_extra = {
+        "transcript_display": data.get("transcript_display"),
         "final_outcome": data.get("final_outcome", ""),
         "trial_booked": data.get("trial_booked", False),
         "trial_cancelled": data.get("trial_cancelled", False),
