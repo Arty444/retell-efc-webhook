@@ -344,9 +344,11 @@ def extract_call_data(body):
         "program": first_booking.get("program") or normalize_program(custom.get("program")),
         "trial_day": first_booking.get("trial_date") or "N/A",
         "trial_time": first_booking.get("trial_time") or "N/A",
-        "call_type": custom.get("Call_Type", ""),
+        # Field names differ by agent generation: McHugh's schema capitalizes
+        # (Call_Type/Spam), factory-built agents use lowercase (call_type/spam).
+        "call_type": custom.get("Call_Type") or custom.get("call_type") or "",
         "call_successful": analysis.get("call_successful", custom.get("Call_Successful", False)),
-        "is_spam": str(custom.get("Spam", "No")).lower() == "yes",
+        "is_spam": str(custom.get("Spam") or custom.get("spam") or "No").lower() == "yes",
         "final_outcome": final_outcome,
         "trial_booked": trial_booked,
         "trial_cancelled": parse_bool(custom.get("trial_cancelled")),
