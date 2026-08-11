@@ -56,6 +56,18 @@ ZAPIER_WEBHOOK_URL = os.environ.get("ZAPIER_WEBHOOK_URL")
 # agent must NEVER be forwarded there, or their callers' data lands in
 # McHugh's Zap history and downstream systems (2026-07-30 cross-tenant fix).
 ZAPIER_CLIENT_ID = os.environ.get("ZAPIER_CLIENT_ID", "6d047c8a-bedf-4feb-9223-803c57a8ce1a")
+
+# Leads rows trigger the external welcome-SMS automation (Supabase->Zapier),
+# which is NOT client-scoped yet — a lead for any client would text the caller
+# McHugh-branded SMS. Until that Zapier gets a client_id filter, only write
+# leads for allowlisted clients (comma-separated env; default: McHugh).
+LEADS_CLIENT_ALLOWLIST = set(
+    s.strip()
+    for s in os.environ.get(
+        "LEADS_CLIENT_ALLOWLIST", "6d047c8a-bedf-4feb-9223-803c57a8ce1a"
+    ).split(",")
+    if s.strip()
+)
 RETELL_API_KEY = os.environ.get("RETELL_API_KEY")
 # Webhook signing key. In this setup it's the same key as RETELL_API_KEY, so we fall
 # back to RETELL_API_KEY when a dedicated secret isn't set.
@@ -413,7 +425,12 @@ def write_to_supabase(data, client_id):
         inserted_call_id = call_result.data[0]["id"] if call_result.data else None
         logger.info("Call written to Supabase: %s", inserted_call_id)
  
-        if is_lead and inserted_call_id:
+        if is_lead and inserted_call_id and client_id not in LEADS_CLIENT_ALLOWLIST:
+            logger.info(
+                "Skipping lead write for client %s (not in LEADS_CLIENT_ALLOWLIST; welcome-SMS Zapier is unscoped)",
+                client_id,
+            )
+        elif is_lead and inserted_call_id:
             lead_records = []
             for booking in data.get("bookings", []):
                 lead_records.append({
